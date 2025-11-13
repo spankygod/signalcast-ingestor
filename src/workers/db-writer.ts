@@ -18,7 +18,7 @@ import { WORKERS } from "../utils/constants";
 export class DbWriterWorker {
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
-  private readonly maxJobAttempts = Number(process.env.JOB_MAX_ATTEMPTS || 5);
+  private readonly maxJobAttempts = Number(process.env.JOB_MAX_ATTEMPTS || 3);
 
   start(): void {
     if (this.timer) return;
