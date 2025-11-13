@@ -4,8 +4,9 @@ import { polymarketClient, PolymarketMarket, PolymarketEvent } from '../config/p
 import { pushUpdate } from '../queues/updates.queue';
 import { normalizeEvent, normalizeMarket } from '../utils/normalizeMarket';
 import { heartbeatMonitor } from './heartbeat';
-import { WORKERS } from '../utils/constants';
+import { QUEUES, WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
+import { redis } from '../lib/redis';
 
 export class MarketsPoller {
   private timer: NodeJS.Timeout | null = null;
@@ -32,6 +33,10 @@ export class MarketsPoller {
 
   private async poll(): Promise<void> {
     if (this.isRunning) {
+      return;
+    }
+
+    if (await this.shouldPauseForEventBacklog()) {
       return;
     }
 
@@ -93,6 +98,23 @@ export class MarketsPoller {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.marketsPoller);
     }
+  }
+
+  private async shouldPauseForEventBacklog(): Promise<boolean> {
+    try {
+      const backlog = await redis.llen(QUEUES.events);
+      if (backlog >= settings.eventQueueBacklogThreshold) {
+        logger.warn('[markets-poller] pausing run due to event queue backlog', {
+          backlog,
+          threshold: settings.eventQueueBacklogThreshold
+        });
+        heartbeatMonitor.markIdle(WORKERS.marketsPoller, { backlog, reason: 'event-backlog' });
+        return true;
+      }
+    } catch (error) {
+      logger.warn('[markets-poller] failed to read event queue backlog', { error: formatError(error) });
+    }
+    return false;
   }
 
   private getEventId(market: PolymarketMarket): string | null {

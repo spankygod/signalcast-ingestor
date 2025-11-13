@@ -7,6 +7,7 @@ export interface IngestorSettings {
   tickRetentionMinutes: number;
   maxConcurrentJobs: number;
   redisEnabled: boolean;
+  eventQueueBacklogThreshold: number;
 }
 
 export const settings: IngestorSettings = {
@@ -17,5 +18,6 @@ export const settings: IngestorSettings = {
   queueDrainIntervalMs: Number(process.env.QUEUE_DRAIN_INTERVAL_MS || 5_000),
   tickRetentionMinutes: Number(process.env.TICK_RETENTION_MINUTES || 60),
   maxConcurrentJobs: Number(process.env.MAX_CONCURRENT_JOBS || 4),
-  redisEnabled: process.env.REDIS_ENABLED !== 'false'
+  redisEnabled: process.env.REDIS_ENABLED !== 'false',
+  eventQueueBacklogThreshold: Number(process.env.EVENT_QUEUE_BACKLOG_THRESHOLD || 500)
 };

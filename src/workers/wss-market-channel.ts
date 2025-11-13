@@ -11,10 +11,29 @@ import { settings } from "../config/settings";
 
 const WORKER_NAME = WORKERS.marketChannel;
 
+export interface MarketChannelSubscription {
+  type: 'subscribe' | 'unsubscribe';
+  channel: string;
+  markets?: string[];
+  assets?: string[];
+  [key: string]: unknown;
+}
+
 export class MarketChannelWorker {
   private socket: WebSocket | null = null;
   private reconnectDelay = 5_000;
   private shouldRun = false;
+  private readonly subscriptions: MarketChannelSubscription[];
+
+  constructor(subscriptions: MarketChannelSubscription[] = []) {
+    // Default subscription to all market prices if none provided
+    this.subscriptions = subscriptions.length > 0
+      ? subscriptions
+      : [{
+          type: 'subscribe',
+          channel: 'prices'
+        }];
+  }
 
   start(): void {
     if (this.shouldRun) return;
@@ -45,12 +64,24 @@ export class MarketChannelWorker {
       logger.info(`${WORKER_NAME} connected`);
       this.reconnectDelay = 5_000;
       heartbeatMonitor.beat(WORKER_NAME, { state: 'connected' });
+      this.sendSubscriptions();
     });
 
     this.socket.on('message', async (raw) => {
       try {
-        const data = JSON.parse(raw.toString());
-        const marketPayload = this.extractMarket(data);
+        const message = JSON.parse(raw.toString());
+
+        if (message?.type === 'ping') {
+          this.send({ type: 'pong' });
+          heartbeatMonitor.beat(WORKER_NAME, { state: 'pong' });
+          return;
+        }
+
+        if (message?.type !== 'channel_data' || !message?.data) {
+          return;
+        }
+
+        const marketPayload = this.extractMarket(message);
         if (!marketPayload?.id) return;
 
         const tick = normalizeTick(this.toMarket(marketPayload));
@@ -80,11 +111,11 @@ export class MarketChannelWorker {
     });
   }
 
-  private extractMarket(payload: any): Partial<PolymarketMarket> | null {
-    if (!payload) return null;
+  private extractMarket(message: any): Partial<PolymarketMarket> | null {
+    if (!message) return null;
+    const payload = message.data ?? message;
     if (payload.market) return payload.market;
     if (payload.data?.market) return payload.data.market;
-    if (payload.data) return payload.data;
     return payload;
   }
 
@@ -133,6 +164,27 @@ export class MarketChannelWorker {
       lastTradePrice: tick.last_trade_price,
       capturedAt: tick.captured_at
     });
+  }
+
+  private sendSubscriptions(): void {
+    logger.info(`${WORKER_NAME} sending subscriptions`, {
+      count: this.subscriptions.length,
+      subscriptions: this.subscriptions
+    });
+
+    for (const subscription of this.subscriptions) {
+      this.send(subscription);
+      logger.debug(`${WORKER_NAME} sent subscription`, { subscription });
+    }
+  }
+
+  private send(payload: Record<string, unknown>): void {
+    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
+      logger.warn(`${WORKER_NAME} cannot send payload - socket not ready`);
+      return;
+    }
+
+    this.socket.send(JSON.stringify(payload));
   }
 }
 
