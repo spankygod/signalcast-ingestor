@@ -2,7 +2,7 @@ import logger, { formatError } from '../lib/logger';
 import { settings } from '../config/settings';
 import { polymarketClient, PolymarketMarket } from '../config/polymarket';
 import { pushUpdate } from '../queues/updates.queue';
-import { normalizeMarket } from '../utils/normalizeMarket';
+import { normalizeEvent, normalizeMarket } from '../utils/normalizeMarket';
 import { heartbeatMonitor } from './heartbeat';
 import { WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
@@ -41,6 +41,7 @@ export class MarketsPoller {
     let fetched = 0;
     let politicsFiltered = 0;
     let queuedUpdates = 0;
+    const enqueuedEvents = new Set<string>();
 
     try {
       while (true) {
@@ -58,7 +59,15 @@ export class MarketsPoller {
         politicsFiltered += filtered.length;
 
         for (const market of filtered) {
-          const eventMeta = market.event ?? { id: market.id };
+          const eventMeta = market.event
+            ? { id: market.event.id }
+            : { id: market.eventId ?? market.id };
+
+          if (market.event && !enqueuedEvents.has(eventMeta.id)) {
+            await pushUpdate('event', normalizeEvent(market.event));
+            enqueuedEvents.add(eventMeta.id);
+          }
+
           await pushUpdate('market', normalizeMarket(market, eventMeta));
           queuedUpdates++;
         }

@@ -29,6 +29,7 @@ export interface PolymarketMarket {
   question: string;
   description: string | null;
   slug: string;
+  eventId?: string;
   startDate: string | null;
   endDate: string | null;
   liquidity: number;
