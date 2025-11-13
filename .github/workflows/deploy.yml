@@ -25,5 +25,6 @@ jobs:
             cd ~/signalcast-ingestor &&
             git pull &&
             pnpm install &&
+            pnpm run build &&
             pm2 restart ingestor
           "

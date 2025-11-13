@@ -73,7 +73,7 @@ export class MarketsPoller {
         fetched += markets.length;
         offset += limit;
 
-        logger.info(`[markets-poller] batch complete | fetched=${fetched} | offset=${offset} | politics=${politicsFiltered} | queued=${queuedUpdates}`);
+        logger.info(`[markets-poller] | ${fetched}/${offset} | politics=${politicsFiltered} | queued=${queuedUpdates}`);
 
         heartbeatMonitor.beat(WORKERS.marketsPoller, { fetched, offset, politicsFiltered, queuedUpdates });
 
