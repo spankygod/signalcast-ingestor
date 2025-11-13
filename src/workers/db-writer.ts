@@ -14,7 +14,7 @@ export class DbWriterWorker {
 
   start(): void {
     if (this.timer) return;
-    logger.info('db-writer', 'starting');
+    logger.info('db-writer starting');
     this.timer = setInterval(() => {
       void this.drain();
     }, settings.queueDrainIntervalMs);
@@ -47,7 +47,7 @@ export class DbWriterWorker {
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
-      logger.error('db-writer', 'failed to drain queue', error);
+      logger.error('db-writer failed to drain queue', { error });
     } finally {
       this.draining = false;
     }
@@ -68,7 +68,7 @@ export class DbWriterWorker {
         await this.insertTick(job.payload as NormalizedTick);
         break;
       default:
-        logger.warning('db-writer', 'received unknown job kind', { kind: job.kind });
+        logger.warn('db-writer received unknown job kind', { kind: job.kind });
     }
   }
 
@@ -106,7 +106,7 @@ export class DbWriterWorker {
   private async upsertMarket(market: NormalizedMarket): Promise<void> {
     const eventId = await this.resolveEventId(market.event_polymarket_id);
     if (!eventId) {
-      logger.warning('db-writer', 'missing parent event for market', { polymarketId: market.event_polymarket_id });
+      logger.warn('db-writer missing parent event for market', { polymarketId: market.event_polymarket_id });
       return;
     }
 
@@ -150,7 +150,7 @@ export class DbWriterWorker {
   private async upsertOutcome(outcome: NormalizedOutcome): Promise<void> {
     const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
     if (!marketId) {
-      logger.warning('db-writer', 'missing parent market for outcome', { polymarketId: outcome.market_polymarket_id });
+      logger.warn('db-writer missing parent market for outcome', { polymarketId: outcome.market_polymarket_id });
       return;
     }
 
@@ -181,7 +181,7 @@ export class DbWriterWorker {
   private async insertTick(tick: NormalizedTick): Promise<void> {
     const marketId = await this.resolveMarketId(tick.market_polymarket_id);
     if (!marketId) {
-      logger.debug('db-writer', 'skipping tick for unknown market', { polymarketId: tick.market_polymarket_id });
+      logger.debug('db-writer skipping tick for unknown market', { polymarketId: tick.market_polymarket_id });
       return;
     }
 

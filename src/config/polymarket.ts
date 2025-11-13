@@ -138,14 +138,14 @@ class PolymarketApiClient {
     this.requestCounter.set(key, count);
 
     if (this.activeRequests.has(key)) {
-      logger.debug('api', 'deduplicated request', { key });
+      logger.debug('api deduplicated request', { key });
       return [];
     }
 
     this.activeRequests.set(key, true);
 
     try {
-      logger.debug('api', 'requesting endpoint', { endpoint, attempt: count, params });
+      logger.debug('api requesting endpoint', { endpoint, attempt: count, params });
       const response = await this.http.get(endpoint, {
         params,
         headers: this.buildHeaders()
@@ -167,7 +167,7 @@ class PolymarketApiClient {
         code: error?.code,
         details: error?.response?.data
       };
-      logger.error('api', `request failed for ${endpoint}`, apiError);
+      logger.error(`api request failed for ${endpoint}`, { error: apiError });
       throw apiError;
     } finally {
       this.activeRequests.delete(key);

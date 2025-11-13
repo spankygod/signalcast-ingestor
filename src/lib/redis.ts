@@ -8,12 +8,15 @@ const redisHost = process.env.REDIS_HOST || 'localhost';
 const redisPort = process.env.REDIS_PORT || '6379';
 const redisPassword = process.env.REDIS_PASSWORD;
 
-const redisUrl = redisPassword 
+const redisUrl = redisPassword
   ? `redis://:${redisPassword}@${redisHost}:${redisPort}`
   : `redis://${redisHost}:${redisPort}`;
+const redisRetryIntervalMs = Number(process.env.REDIS_RETRY_INTERVAL_MS || 10_000);
 
 let redisInstance: Redis | null = null;
 let redisAvailable = false;
+let reconnectTimer: NodeJS.Timeout | null = null;
+let initializing = false;
 
 // Create a no-op Redis fallback for when Redis is not available
 class NoOpRedis {
@@ -54,8 +57,29 @@ class NoOpRedis {
   }
 }
 
+function scheduleReconnect(): void {
+  if (reconnectTimer || !settings.redisEnabled) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    void initializeRedis(true);
+  }, redisRetryIntervalMs);
+}
+
+function teardownClient(): void {
+  if (redisInstance) {
+    try {
+      redisInstance.removeAllListeners();
+      redisInstance.disconnect(false);
+    } catch {
+      // ignore disconnect errors
+    }
+  }
+  redisInstance = null;
+  redisAvailable = false;
+}
+
 // Try to connect to Redis
-async function initializeRedis(): Promise<void> {
+async function initializeRedis(force = false): Promise<void> {
   // Skip Redis initialization if disabled
   if (!settings.redisEnabled) {
     console.log('[redis] Redis is disabled via REDIS_ENABLED=false');
@@ -63,30 +87,50 @@ async function initializeRedis(): Promise<void> {
     return;
   }
 
+  if (initializing) return;
+  if (redisInstance && redisAvailable && !force) return;
+
+  initializing = true;
   try {
-    redisInstance = new Redis(redisUrl, {
+    const client = new Redis(redisUrl, {
       maxRetriesPerRequest: 0,
       lazyConnect: true,
       connectTimeout: 2000
     });
 
-    redisInstance.on('connect', () => {
+    client.on('connect', () => {
       console.log('[redis] connected successfully');
       redisAvailable = true;
     });
 
-    redisInstance.on('error', (error: Error) => {
-      console.warn('[redis] connection failed, Redis will be disabled:', error.message);
-      redisAvailable = false;
-      redisInstance = null;
-    });
+    const handleDisconnect = (reason: string, error?: Error) => {
+      const base = '[redis] connection lost';
+      const message = error ? `${base} (${reason}): ${error.message}` : `${base} (${reason})`;
+      console.warn(message);
+      try {
+        client.removeAllListeners();
+        client.disconnect(false);
+      } catch {
+        // ignore disconnect errors
+      }
+      teardownClient();
+      scheduleReconnect();
+    };
+
+    client.on('error', (error: Error) => handleDisconnect('error', error));
+    client.on('end', () => handleDisconnect('end'));
 
     // Try to connect immediately
-    await redisInstance.connect();
+    await client.connect();
+    redisInstance = client;
+    redisAvailable = true;
   } catch (error) {
-    console.warn('[redis] creating client failed, Redis will be disabled');
-    redisAvailable = false;
-    redisInstance = null;
+    const message = error instanceof Error ? error.message : 'unknown';
+    console.warn('[redis] creating client failed, Redis will be disabled:', message);
+    teardownClient();
+    scheduleReconnect();
+  } finally {
+    initializing = false;
   }
 }
 
@@ -98,31 +142,49 @@ const redisFallback = {
   async setex(key: string, ttl: number, value: string): Promise<void> {
     if (redisAvailable && redisInstance) {
       await redisInstance.setex(key, ttl, value);
+    } else {
+      scheduleReconnect();
     }
   },
 
   async get(key: string): Promise<string | null> {
-    return redisAvailable && redisInstance ? await redisInstance.get(key) : null;
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.get(key);
+    }
+    scheduleReconnect();
+    return null;
   },
 
   async del(key: string): Promise<void> {
     if (redisAvailable && redisInstance) {
       await redisInstance.del(key);
+    } else {
+      scheduleReconnect();
     }
   },
 
   async lpush(key: string, value: string): Promise<void> {
     if (redisAvailable && redisInstance) {
       await redisInstance.lpush(key, value);
+    } else {
+      scheduleReconnect();
     }
   },
 
   async rpop(key: string): Promise<string | null> {
-    return redisAvailable && redisInstance ? await redisInstance.rpop(key) : null;
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.rpop(key);
+    }
+    scheduleReconnect();
+    return null;
   },
 
   async llen(key: string): Promise<number> {
-    return redisAvailable && redisInstance ? await redisInstance.llen(key) : 0;
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.llen(key);
+    }
+    scheduleReconnect();
+    return 0;
   },
 
   on(event: string, callback: (...args: any[]) => void): void {

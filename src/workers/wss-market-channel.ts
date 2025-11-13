@@ -37,12 +37,12 @@ export class MarketChannelWorker {
     if (!this.shouldRun) return;
 
     const url = `${polymarketConfig.wsBaseUrl}${process.env.POLYMARKET_WS_PATH || '/prices'}`;
-    logger.info(WORKER_NAME, 'connecting', { url });
+    logger.info(`${WORKER_NAME} connecting`, { url });
 
     this.socket = new WebSocket(url);
 
     this.socket.on('open', () => {
-      logger.info(WORKER_NAME, 'connected');
+      logger.info(`${WORKER_NAME} connected`);
       this.reconnectDelay = 5_000;
       heartbeatMonitor.beat(WORKER_NAME, { state: 'connected' });
     });
@@ -61,16 +61,16 @@ export class MarketChannelWorker {
         }
         heartbeatMonitor.beat(WORKER_NAME, { state: 'tick' });
       } catch (error) {
-        logger.warn(WORKER_NAME, 'failed to process tick', error);
+        logger.warn(`${WORKER_NAME} failed to process tick`, { error });
       }
     });
 
     this.socket.on('error', (error) => {
-      logger.error(WORKER_NAME, 'socket error', error);
+      logger.error(`${WORKER_NAME} socket error`, { error });
     });
 
     this.socket.on('close', async () => {
-      logger.warn(WORKER_NAME, 'connection closed');
+      logger.warn(`${WORKER_NAME} connection closed`);
       heartbeatMonitor.markIdle(WORKER_NAME, { state: 'disconnected' });
       if (!this.shouldRun) return;
       await sleep(this.reconnectDelay);

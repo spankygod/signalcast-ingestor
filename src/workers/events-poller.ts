@@ -69,7 +69,7 @@ export class EventsPoller {
 
       logger.info(`[events-poller] run finished fetched=${fetched} offset=${offset}`);
     } catch (error) {
-      logger.error('[events-poller] failed to poll events', error);
+      logger.error('[events-poller] failed to poll events', { error });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.eventsPoller);

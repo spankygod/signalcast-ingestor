@@ -19,23 +19,23 @@ const workers = [
 ];
 
 export function startIngestor(): void {
-  logger.info('ingestor', 'booting workers');
+  logger.info('ingestor booting workers');
   workers.forEach(worker => {
     try {
       worker.start();
     } catch (error) {
-      logger.error('ingestor', `failed to start ${worker.name}`, error);
+      logger.error(`ingestor failed to start ${worker.name}`, { error });
     }
   });
 }
 
 export async function stopIngestor(): Promise<void> {
-  logger.info('ingestor', 'stopping workers');
+  logger.info('ingestor stopping workers');
   for (const worker of workers) {
     try {
       worker.stop();
     } catch (error) {
-      logger.error('ingestor', `failed to stop ${worker.name}`, error);
+      logger.error(`ingestor failed to stop ${worker.name}`, { error });
     }
   }
 }
@@ -44,7 +44,7 @@ if (require.main === module) {
   startIngestor();
 
   const shutdown = async (signal: NodeJS.Signals) => {
-    logger.info('ingestor', 'received shutdown signal', { signal });
+    logger.info('ingestor received shutdown signal', { signal });
     await stopIngestor();
     process.exit(0);
   };

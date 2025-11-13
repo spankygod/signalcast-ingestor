@@ -71,7 +71,7 @@ export class OutcomesPoller {
 
       logger.info(`[outcomes-poller] run finished fetched=${fetched} offset=${offset}`);
     } catch (error) {
-      logger.error('[outcomes-poller] failed to poll outcomes', error);
+      logger.error('[outcomes-poller] failed to poll outcomes', { error });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.outcomesPoller);

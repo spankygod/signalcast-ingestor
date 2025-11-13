@@ -55,9 +55,9 @@ export class HeartbeatMonitor {
   private async logQueueDepth(): Promise<void> {
     try {
       const queueLength = await redis.llen(QUEUES.updates);
-      logger.info('heartbeat', 'queue stats', { queueLength, timestamp: new Date().toISOString() });
+      logger.info('heartbeat queue stats', { queueLength, timestamp: new Date().toISOString() });
     } catch (error) {
-      logger.error('heartbeat', 'failed to read queue depth', error);
+      logger.error('heartbeat failed to read queue depth', { error });
     }
   }
 
@@ -68,7 +68,7 @@ export class HeartbeatMonitor {
     for (const [workerId, state] of this.workers.entries()) {
       const lagMs = now - state.lastBeat;
       if (lagMs > threshold) {
-        logger.warning('heartbeat', `worker ${workerId} has not reported recently`, { lagMs, state });
+        logger.warn('heartbeat worker missing recent report', { workerId, lagMs, state });
       }
     }
   }

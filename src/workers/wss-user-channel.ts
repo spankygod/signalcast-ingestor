@@ -73,7 +73,7 @@ export class WssUserChannelWorker {
     try {
       const token = await this.ensureToken();
       const url = `${polymarketConfig.wsBaseUrl}${this.userPath}`;
-      logger.info(this.workerId, 'connecting', { url });
+      logger.info(`${this.workerId} connecting`, { url });
 
       this.socket = new WebSocket(url, {
         headers: {
@@ -86,13 +86,13 @@ export class WssUserChannelWorker {
       this.socket.on('error', (error) => this.handleError(error));
       this.socket.on('close', (code, reason) => void this.handleClose(code, reason));
     } catch (error) {
-      logger.error(this.workerId, 'failed to establish connection', error);
+      logger.error(`${this.workerId} failed to establish connection`, { error });
       await this.scheduleReconnect();
     }
   }
 
   private handleOpen(): void {
-    logger.info(this.workerId, 'connected');
+    logger.info(`${this.workerId} connected`);
     this.reconnectDelay = 5_000;
     heartbeatMonitor.beat(this.workerId, { state: 'connected' });
     this.flushSubscriptions();
@@ -110,16 +110,16 @@ export class WssUserChannelWorker {
 
       console.log(`[${this.workerId}]`, 'message', payload);
     } catch (error) {
-      logger.warn(this.workerId, 'failed to handle message', error);
+      logger.warn(`${this.workerId} failed to handle message`, { error });
     }
   }
 
   private handleError(error: Error): void {
-    logger.error(this.workerId, 'socket error', error);
+    logger.error(`${this.workerId} socket error`, { error });
   }
 
   private async handleClose(code: number, reason: Buffer): Promise<void> {
-    logger.warn(this.workerId, 'connection closed', {
+    logger.warn(`${this.workerId} connection closed`, {
       code,
       reason: reason.toString()
     });
@@ -154,7 +154,7 @@ export class WssUserChannelWorker {
     this.tokenTimer = setTimeout(() => {
       this.token = null;
       if (this.socket) {
-        logger.info(this.workerId, 'refreshing token, restarting socket');
+        logger.info(`${this.workerId} refreshing token, restarting socket`);
         this.socket.terminate();
       } else if (this.shouldRun) {
         void this.connect();
