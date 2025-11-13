@@ -135,9 +135,9 @@ export class DbWriterWorker {
       closed: event.closed,
       archived: event.archived,
       restricted: event.restricted,
-      startDate: event.start_date,
-      endDate: event.end_date,
-      lastIngestedAt: event.last_ingested_at,
+      startDate: this.toDate(event.start_date),
+      endDate: this.toDate(event.end_date),
+      lastIngestedAt: this.toDate(event.last_ingested_at) ?? new Date(),
       updatedAt: new Date()
     };
 
@@ -167,7 +167,7 @@ export class DbWriterWorker {
       bestBid: this.decimal(market.best_bid),
       bestAsk: this.decimal(market.best_ask),
       status: market.status,
-      resolvedAt: market.resolved_at,
+      resolvedAt: this.toDate(market.resolved_at),
       active: market.is_active,
       closed: market.closed,
       archived: market.archived,
@@ -224,7 +224,7 @@ export class DbWriterWorker {
       lastTradePrice: this.decimal(tick.last_trade_price),
       liquidity: this.decimal(tick.liquidity),
       volume24h: this.decimal(tick.volume_24h),
-      updatedAt: tick.captured_at
+      updatedAt: this.toDate(tick.captured_at) ?? new Date()
     });
   }
 
@@ -376,6 +376,13 @@ export class DbWriterWorker {
       return null;
     }
     return value.toString();
+  }
+
+  private toDate(value: Date | string | null | undefined): Date | null {
+    if (!value) return null;
+    if (value instanceof Date) return value;
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
 }
 
