@@ -35,7 +35,7 @@ export async function stopIngestor(): Promise<void> {
     try {
       worker.stop();
     } catch (error) {
-      logger.error(`ingestor failed to stop${worker.name}`, { error: formatError(error) });
+      logger.error(`ingestor failed to stop ${worker.name}`, { error: formatError(error) });
     }
   }
 }
