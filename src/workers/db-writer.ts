@@ -1,9 +1,16 @@
 import { eq } from "drizzle-orm";
 import logger, { formatError } from "../lib/logger";
 import { settings } from "../config/settings";
-import { pullNextUpdate, UpdateJob } from "../queues/updates.queue";
+import { polymarketClient } from "../config/polymarket";
+import { pullNextUpdate, pushUpdate, UpdateJob, UpdateKind } from "../queues/updates.queue";
 import { db, events, markets, outcomes, marketPricesRealtime } from "../lib/db";
-import { NormalizedEvent, NormalizedMarket, NormalizedOutcome } from "../utils/normalizeMarket";
+import {
+  NormalizedEvent,
+  NormalizedMarket,
+  NormalizedOutcome,
+  normalizeEvent,
+  normalizeMarket
+} from "../utils/normalizeMarket";
 import { NormalizedTick } from "../utils/normalizeTick";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
@@ -11,6 +18,7 @@ import { WORKERS } from "../utils/constants";
 export class DbWriterWorker {
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
+  private readonly maxJobAttempts = Number(process.env.JOB_MAX_ATTEMPTS || 5);
 
   start(): void {
     if (this.timer) return;
@@ -30,20 +38,22 @@ export class DbWriterWorker {
   private async drain(): Promise<void> {
     if (this.draining) return;
     this.draining = true;
-
-    let processed = 0;
-    heartbeatMonitor.beat(WORKERS.dbWriter, { processed });
+    heartbeatMonitor.beat(WORKERS.dbWriter, { state: 'draining' });
 
     try {
-      while (processed < settings.maxConcurrentJobs) {
-        const job = await pullNextUpdate();
-        if (!job) break;
-        await this.handleJob(job);
-        processed += 1;
-        heartbeatMonitor.beat(WORKERS.dbWriter, { processed });
+      let totalProcessed = 0;
+      const pipeline: Array<{ kind: UpdateKind; handler: (job: UpdateJob<any>) => Promise<boolean> }> = [
+        { kind: 'event', handler: (job) => this.processEventJob(job as UpdateJob<NormalizedEvent>) },
+        { kind: 'market', handler: (job) => this.processMarketJob(job as UpdateJob<NormalizedMarket>) },
+        { kind: 'outcome', handler: (job) => this.processOutcomeJob(job as UpdateJob<NormalizedOutcome>) },
+        { kind: 'tick', handler: (job) => this.processTickJob(job as UpdateJob<NormalizedTick>) }
+      ];
+
+      for (const stage of pipeline) {
+        totalProcessed += await this.processQueue(stage.kind, stage.handler);
       }
 
-      if (processed === 0) {
+      if (totalProcessed === 0) {
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
@@ -53,23 +63,62 @@ export class DbWriterWorker {
     }
   }
 
-  private async handleJob(job: UpdateJob<any>): Promise<void> {
-    switch (job.kind) {
-      case 'event':
-        await this.upsertEvent(job.payload as NormalizedEvent);
-        break;
-      case 'market':
-        await this.upsertMarket(job.payload as NormalizedMarket);
-        break;
-      case 'outcome':
-        await this.upsertOutcome(job.payload as NormalizedOutcome);
-        break;
-      case 'tick':
-        await this.insertTick(job.payload as NormalizedTick);
-        break;
-      default:
-        logger.warn('db-writer received unknown job kind', { kind: job.kind });
+  private async processQueue(
+    kind: UpdateKind,
+    handler: (job: UpdateJob<any>) => Promise<boolean>
+  ): Promise<number> {
+    let processed = 0;
+
+    while (true) {
+      const job = await pullNextUpdate(kind);
+      if (!job) break;
+
+      const handled = await handler(job);
+      if (handled) {
+        processed += 1;
+        heartbeatMonitor.beat(WORKERS.dbWriter, { kind, processed });
+      }
     }
+
+    return processed;
+  }
+
+  private async processEventJob(job: UpdateJob<NormalizedEvent>): Promise<boolean> {
+    await this.upsertEvent(job.payload);
+    return true;
+  }
+
+  private async processMarketJob(job: UpdateJob<NormalizedMarket>): Promise<boolean> {
+    const market = job.payload;
+    const eventId = await this.resolveEventId(market.event_polymarket_id);
+    if (!eventId) {
+      return await this.handleMissingEventForMarket(market, job);
+    }
+
+    await this.upsertMarket(market, eventId);
+    return true;
+  }
+
+  private async processOutcomeJob(job: UpdateJob<NormalizedOutcome>): Promise<boolean> {
+    const outcome = job.payload;
+    const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
+    if (!marketId) {
+      return await this.handleMissingMarketForOutcome(outcome, job);
+    }
+
+    await this.upsertOutcome(outcome, marketId);
+    return true;
+  }
+
+  private async processTickJob(job: UpdateJob<NormalizedTick>): Promise<boolean> {
+    const tick = job.payload;
+    const marketId = await this.resolveMarketId(tick.market_polymarket_id);
+    if (!marketId) {
+      return await this.handleMissingMarketForTick(tick, job);
+    }
+
+    await this.insertTick(tick, marketId);
+    return true;
   }
 
   private async upsertEvent(event: NormalizedEvent): Promise<void> {
@@ -103,13 +152,7 @@ export class DbWriterWorker {
       });
   }
 
-  private async upsertMarket(market: NormalizedMarket): Promise<void> {
-    const eventId = await this.resolveEventId(market.event_polymarket_id);
-    if (!eventId) {
-      logger.warn('db-writer missing parent event for market', { polymarketId: market.event_polymarket_id });
-      return;
-    }
-
+  private async upsertMarket(market: NormalizedMarket, eventId: string): Promise<void> {
     const values = {
       polymarketId: market.polymarket_id,
       eventId,
@@ -147,13 +190,7 @@ export class DbWriterWorker {
       });
   }
 
-  private async upsertOutcome(outcome: NormalizedOutcome): Promise<void> {
-    const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
-    if (!marketId) {
-      logger.warn('db-writer missing parent market for outcome', { polymarketId: outcome.market_polymarket_id });
-      return;
-    }
-
+  private async upsertOutcome(outcome: NormalizedOutcome, marketId: string): Promise<void> {
     const values = {
       polymarketId: outcome.polymarket_id,
       marketId,
@@ -178,13 +215,7 @@ export class DbWriterWorker {
       });
   }
 
-  private async insertTick(tick: NormalizedTick): Promise<void> {
-    const marketId = await this.resolveMarketId(tick.market_polymarket_id);
-    if (!marketId) {
-      logger.debug('db-writer skipping tick for unknown market', { polymarketId: tick.market_polymarket_id });
-      return;
-    }
-
+  private async insertTick(tick: NormalizedTick, marketId: string): Promise<void> {
     await db.insert(marketPricesRealtime).values({
       marketId,
       price: this.decimal(tick.price),
@@ -195,6 +226,129 @@ export class DbWriterWorker {
       volume24h: this.decimal(tick.volume_24h),
       updatedAt: tick.captured_at
     });
+  }
+
+  private async handleMissingEventForMarket(
+    market: NormalizedMarket,
+    job: UpdateJob<NormalizedMarket>
+  ): Promise<boolean> {
+    const fetched = await this.fetchAndEnqueueEvent(market.event_polymarket_id);
+    const requeued = await this.requeueJob('market', job);
+
+    if (requeued) {
+      logger.debug('db-writer requeued market awaiting parent event', {
+        polymarketId: market.polymarket_id,
+        eventPolymarketId: market.event_polymarket_id,
+        fetched
+      });
+      return false;
+    }
+
+    logger.warn('db-writer dropping market after missing parent event', {
+      polymarketId: market.polymarket_id,
+      eventPolymarketId: market.event_polymarket_id,
+      fetched
+    });
+    return true;
+  }
+
+  private async handleMissingMarketForOutcome(
+    outcome: NormalizedOutcome,
+    job: UpdateJob<NormalizedOutcome>
+  ): Promise<boolean> {
+    const fetched = await this.fetchAndEnqueueMarket(outcome.market_polymarket_id);
+    const requeued = await this.requeueJob('outcome', job);
+
+    if (requeued) {
+      logger.debug('db-writer requeued outcome awaiting parent market', {
+        polymarketId: outcome.polymarket_id,
+        marketPolymarketId: outcome.market_polymarket_id,
+        fetched
+      });
+      return false;
+    }
+
+    logger.warn('db-writer dropping outcome after missing parent market', {
+      polymarketId: outcome.polymarket_id,
+      marketPolymarketId: outcome.market_polymarket_id,
+      fetched
+    });
+    return true;
+  }
+
+  private async handleMissingMarketForTick(
+    tick: NormalizedTick,
+    job: UpdateJob<NormalizedTick>
+  ): Promise<boolean> {
+    const fetched = await this.fetchAndEnqueueMarket(tick.market_polymarket_id);
+    const requeued = fetched ? await this.requeueJob('tick', job) : false;
+
+    if (requeued) {
+      logger.debug('db-writer requeued tick awaiting parent market', {
+        marketPolymarketId: tick.market_polymarket_id
+      });
+      return false;
+    }
+
+    logger.debug('db-writer skipping tick for unknown market', { polymarketId: tick.market_polymarket_id });
+    return true;
+  }
+
+  private async requeueJob<T>(kind: UpdateKind, job: UpdateJob<T>): Promise<boolean> {
+    const attempts = job.attempts ?? 0;
+    if (attempts >= this.maxJobAttempts) {
+      logger.warn('db-writer max attempts exceeded, dropping job', {
+        kind,
+        attempts,
+        queuedAt: job.queuedAt
+      });
+      return false;
+    }
+
+    await pushUpdate(kind, job.payload, attempts + 1);
+    return true;
+  }
+
+  private async fetchAndEnqueueEvent(polymarketId: string): Promise<boolean> {
+    try {
+      const event = await polymarketClient.getEvent(polymarketId);
+      if (!event) {
+        logger.warn('db-writer event lookup returned no data', { polymarketId });
+        return false;
+      }
+
+      await pushUpdate('event', normalizeEvent(event));
+      return true;
+    } catch (error) {
+      logger.warn('db-writer failed to fetch event from API', {
+        polymarketId,
+        error: formatError(error)
+      });
+      return false;
+    }
+  }
+
+  private async fetchAndEnqueueMarket(polymarketId: string): Promise<boolean> {
+    try {
+      const market = await polymarketClient.getMarket(polymarketId);
+      if (!market) {
+        logger.warn('db-writer market lookup returned no data', { polymarketId });
+        return false;
+      }
+
+      const eventId = market.event?.id ?? market.eventId ?? market.id;
+      if (market.event) {
+        await pushUpdate('event', normalizeEvent(market.event));
+      }
+      await pushUpdate('market', normalizeMarket(market, { id: eventId }));
+      return true;
+    } catch (error) {
+      logger.warn('db-writer failed to fetch market from API', {
+        polymarketId,
+        error: formatError(error)
+      });
+      return false;
+    }
   }
 
   private async resolveEventId(polymarketId: string): Promise<string | null> {

@@ -1,6 +1,6 @@
 import logger, { formatError } from '../lib/logger';
 import { settings } from '../config/settings';
-import { polymarketClient, PolymarketMarket } from '../config/polymarket';
+import { polymarketClient, PolymarketMarket, PolymarketEvent } from '../config/polymarket';
 import { pushUpdate } from '../queues/updates.queue';
 import { normalizeEvent, normalizeMarket } from '../utils/normalizeMarket';
 import { heartbeatMonitor } from './heartbeat';
@@ -10,6 +10,7 @@ import { politicsFilter } from '../utils/politicsFilter';
 export class MarketsPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private knownEvents = new Set<string>();
 
   start(): void {
     if (this.timer) return;
@@ -41,7 +42,6 @@ export class MarketsPoller {
     let fetched = 0;
     let politicsFiltered = 0;
     let queuedUpdates = 0;
-    const enqueuedEvents = new Set<string>();
 
     try {
       while (true) {
@@ -59,16 +59,14 @@ export class MarketsPoller {
         politicsFiltered += filtered.length;
 
         for (const market of filtered) {
-          const eventMeta = market.event
-            ? { id: market.event.id }
-            : { id: market.eventId ?? market.id };
-
-          if (market.event && !enqueuedEvents.has(eventMeta.id)) {
-            await pushUpdate('event', normalizeEvent(market.event));
-            enqueuedEvents.add(eventMeta.id);
+          const eventId = this.getEventId(market);
+          if (!eventId) {
+            logger.warn('[markets-poller] skipping market with missing event id', { polymarketId: market.id });
+            continue;
           }
 
-          await pushUpdate('market', normalizeMarket(market, eventMeta));
+          await this.ensureEventQueued(eventId, market.event);
+          await pushUpdate('market', normalizeMarket(market, { id: eventId }));
           queuedUpdates++;
         }
 
@@ -95,6 +93,37 @@ export class MarketsPoller {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.marketsPoller);
     }
+  }
+
+  private getEventId(market: PolymarketMarket): string | null {
+    return market.event?.id ?? market.eventId ?? market.id ?? null;
+  }
+
+  private async ensureEventQueued(eventId: string, event?: PolymarketEvent): Promise<void> {
+    if (this.knownEvents.has(eventId)) {
+      return;
+    }
+
+    let eventData: PolymarketEvent | null | undefined = event;
+    if (!eventData) {
+      try {
+        eventData = await polymarketClient.getEvent(eventId);
+      } catch (lookupError) {
+        logger.warn('[markets-poller] failed to fetch event for market', {
+          eventId,
+          error: formatError(lookupError)
+        });
+        return;
+      }
+    }
+
+    if (!eventData) {
+      logger.warn('[markets-poller] event lookup returned empty result', { eventId });
+      return;
+    }
+
+    await pushUpdate('event', normalizeEvent(eventData));
+    this.knownEvents.add(eventId);
   }
 }
 

@@ -1,5 +1,8 @@
 export const QUEUES = {
-  updates: 'signalcast:queue:updates'
+  events: 'signalcast:queue:events',
+  markets: 'signalcast:queue:markets',
+  outcomes: 'signalcast:queue:outcomes',
+  ticks: 'signalcast:queue:ticks'
 } as const;
 
 export const WORKERS = {
