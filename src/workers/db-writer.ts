@@ -57,7 +57,7 @@ export class DbWriterWorker {
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
-      logger.error('db-writer failed to drain queue', { error: formatError(error) });
+      logger.error('db-writer failed to drain queues', { error: formatError(error) });
     } finally {
       this.draining = false;
     }
