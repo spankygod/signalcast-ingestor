@@ -109,7 +109,7 @@ export interface PolymarketConfig {
 
 export const polymarketConfig: PolymarketConfig = {
   restBaseUrl: process.env.POLYMARKET_REST_URL || 'https://gamma-api.polymarket.com',
-  wsBaseUrl: process.env.POLYMARKET_WS_URL || 'wss://ws.polymarket.com',
+  wsBaseUrl: process.env.POLYMARKET_WS_URL || 'wss://ws-subscriptions-clob.polymarket.com',
   rateLimitMs: Number(process.env.POLYMARKET_RATE_LIMIT_MS || 1000)
 };
 
