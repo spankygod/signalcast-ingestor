@@ -1,4 +1,4 @@
-import logger from '../lib/logger';
+import logger, { formatError } from '../lib/logger';
 import { settings } from '../config/settings';
 import { polymarketClient, PolymarketMarket } from '../config/polymarket';
 import { pushUpdate } from '../queues/updates.queue';
@@ -76,7 +76,12 @@ export class MarketsPoller {
       const politicsPercent = fetched > 0 ? ((politicsFiltered / fetched) * 100).toFixed(1) : '0.0';
       logger.info(`[markets-poller] ✓ Completed | ${fetched} fetched | ${politicsFiltered} politics (${politicsPercent}%) | ${queuedUpdates} queued`);
     } catch (error) {
-      logger.error('[markets-poller] poll failed', { error, fetched, politicsFiltered, queuedUpdates });
+      logger.error('[markets-poller] poll failed', {
+        error: formatError(error),
+        fetched,
+        politicsFiltered,
+        queuedUpdates
+      });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.marketsPoller);

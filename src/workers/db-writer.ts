@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import logger from "../lib/logger";
+import logger, { formatError } from "../lib/logger";
 import { settings } from "../config/settings";
 import { pullNextUpdate, UpdateJob } from "../queues/updates.queue";
 import { db, events, markets, outcomes, marketPricesRealtime } from "../lib/db";
@@ -47,7 +47,7 @@ export class DbWriterWorker {
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
-      logger.error('db-writer failed to drain queue', { error });
+      logger.error('db-writer failed to drain queue', { error: formatError(error) });
     } finally {
       this.draining = false;
     }

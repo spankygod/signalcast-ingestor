@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from 'axios';
-import logger from '../lib/logger';
+import logger, { formatError } from '../lib/logger';
 import { sleep } from '../lib/retry';
 
 export interface PolymarketTag {
@@ -167,7 +167,7 @@ class PolymarketApiClient {
         code: error?.code,
         details: error?.response?.data
       };
-      logger.error(`api request failed for ${endpoint}`, { error: apiError });
+      logger.error(`api request failed for ${endpoint}`, { error: formatError(apiError) });
       throw apiError;
     } finally {
       this.activeRequests.delete(key);

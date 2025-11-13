@@ -1,4 +1,4 @@
-import logger from '../lib/logger';
+import logger, { formatError } from '../lib/logger';
 import { settings } from '../config/settings';
 import { polymarketClient } from '../config/polymarket';
 import { pushUpdate } from '../queues/updates.queue';
@@ -69,7 +69,7 @@ export class EventsPoller {
 
       logger.info(`[events-poller] run finished fetched=${fetched} offset=${offset}`);
     } catch (error) {
-      logger.error('[events-poller] failed to poll events', { error });
+      logger.error('[events-poller] failed to poll events', { error: formatError(error) });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.eventsPoller);

@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import logger from '../lib/logger';
+import logger, { formatError } from '../lib/logger';
 import { polymarketConfig } from '../config/polymarket';
 import { sleep } from '../lib/retry';
 import { heartbeatMonitor } from './heartbeat';
@@ -86,7 +86,7 @@ export class WssUserChannelWorker {
       this.socket.on('error', (error) => this.handleError(error));
       this.socket.on('close', (code, reason) => void this.handleClose(code, reason));
     } catch (error) {
-      logger.error(`${this.workerId} failed to establish connection`, { error });
+      logger.error(`${this.workerId} failed to establish connection`, { error: formatError(error) });
       await this.scheduleReconnect();
     }
   }
@@ -110,12 +110,12 @@ export class WssUserChannelWorker {
 
       console.log(`[${this.workerId}]`, 'message', payload);
     } catch (error) {
-      logger.warn(`${this.workerId} failed to handle message`, { error });
+      logger.warn(`${this.workerId} failed to handle message`, { error: formatError(error) });
     }
   }
 
   private handleError(error: Error): void {
-    logger.error(`${this.workerId} socket error`, { error });
+    logger.error(`${this.workerId} socket error`, { error: formatError(error) });
   }
 
   private async handleClose(code: number, reason: Buffer): Promise<void> {

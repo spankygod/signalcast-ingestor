@@ -1,4 +1,4 @@
-import logger from '../lib/logger';
+import logger, { formatError } from '../lib/logger';
 import { settings } from '../config/settings';
 import { polymarketClient } from '../config/polymarket';
 import { pushUpdate } from '../queues/updates.queue';
@@ -71,7 +71,7 @@ export class OutcomesPoller {
 
       logger.info(`[outcomes-poller] run finished fetched=${fetched} offset=${offset}`);
     } catch (error) {
-      logger.error('[outcomes-poller] failed to poll outcomes', { error });
+      logger.error('[outcomes-poller] failed to poll outcomes', { error: formatError(error) });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.outcomesPoller);

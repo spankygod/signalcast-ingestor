@@ -1,4 +1,4 @@
-import logger from "../lib/logger";
+import logger, { formatError } from "../lib/logger";
 import { settings } from "../config/settings";
 import { redis } from "../lib/redis";
 import { QUEUES } from "../utils/constants";
@@ -57,7 +57,7 @@ export class HeartbeatMonitor {
       const queueLength = await redis.llen(QUEUES.updates);
       logger.info('heartbeat queue stats', { queueLength, timestamp: new Date().toISOString() });
     } catch (error) {
-      logger.error('heartbeat failed to read queue depth', { error });
+      logger.error('heartbeat failed to read queue depth', { error: formatError(error) });
     }
   }
 

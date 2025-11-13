@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import logger from "../lib/logger";
+import logger, { formatError } from "../lib/logger";
 import { polymarketConfig, PolymarketMarket } from "../config/polymarket";
 import { pushUpdate } from "../queues/updates.queue";
 import { normalizeTick, NormalizedTick } from "../utils/normalizeTick";
@@ -61,12 +61,12 @@ export class MarketChannelWorker {
         }
         heartbeatMonitor.beat(WORKER_NAME, { state: 'tick' });
       } catch (error) {
-        logger.warn(`${WORKER_NAME} failed to process tick`, { error });
+        logger.warn(`${WORKER_NAME} failed to process tick`, { error: formatError(error) });
       }
     });
 
     this.socket.on('error', (error) => {
-      logger.error(`${WORKER_NAME} socket error`, { error });
+      logger.error(`${WORKER_NAME} socket error`, { error: formatError(error) });
     });
 
     this.socket.on('close', async () => {

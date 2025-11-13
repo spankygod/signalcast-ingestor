@@ -1,7 +1,7 @@
 import dotenv from "dotenv";
 dotenv.config();
 
-import logger from "./lib/logger";
+import logger, { formatError } from "./lib/logger";
 import { eventsPoller } from "./workers/events-poller";
 import { marketsPoller } from "./workers/markets-poller";
 import { outcomesPoller } from "./workers/outcomes-poller";
@@ -24,7 +24,7 @@ export function startIngestor(): void {
     try {
       worker.start();
     } catch (error) {
-      logger.error(`ingestor failed to start ${worker.name}`, { error });
+      logger.error(`ingestor failed to start ${worker.name}`, { error: formatError(error) });
     }
   });
 }
@@ -35,7 +35,7 @@ export async function stopIngestor(): Promise<void> {
     try {
       worker.stop();
     } catch (error) {
-      logger.error(`ingestor failed to stop ${worker.name}`, { error });
+      logger.error(`ingestor failed to stop ${worker.name}`, { error: formatError(error) });
     }
   }
 }

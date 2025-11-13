@@ -36,3 +36,33 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 export default logger;
+
+export function formatError(error: unknown): Record<string, unknown> {
+  if (!error) {
+    return {};
+  }
+
+  if (error instanceof Error) {
+    const serialized: Record<string, unknown> = {
+      name: error.name,
+      message: error.message,
+      stack: error.stack
+    };
+
+    const anyError = error as unknown as Record<string, unknown> & { [key: string]: unknown };
+    for (const key of Object.keys(anyError)) {
+      const value = anyError[key];
+      if (value !== undefined && serialized[key] === undefined) {
+        serialized[key] = value;
+      }
+    }
+
+    return serialized;
+  }
+
+  if (typeof error === 'object') {
+    return { ...(error as Record<string, unknown>) };
+  }
+
+  return { message: String(error) };
+}
