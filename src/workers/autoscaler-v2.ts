@@ -118,22 +118,33 @@ export class AutoscalerV2 {
   }
 
   private async monitorPrimary(): Promise<void> {
+    console.log("[AUTOSCALER-DEBUG] Monitoring primary...");
     try {
       const lockInfo = await redis.get(this.coordinationKey);
+      console.log("[AUTOSCALER-DEBUG] Primary lock info:", lockInfo);
 
       if (!lockInfo) {
+        console.log("[AUTOSCALER-DEBUG] Primary lost, attempting to become primary");
         logger.info("[autoscaler-v2] primary lost, attempting to become primary");
         this.isPrimary = await this.acquireCoordinationLock();
+        console.log("[AUTOSCALER-DEBUG] Promotion result:", this.isPrimary);
 
         if (this.isPrimary) {
+          console.log("[AUTOSCALER-DEBUG] Promoted to primary, restarting timer");
           logger.info("[autoscaler-v2] promoted to primary");
           // Restart as primary
           if (this.timer) clearInterval(this.timer);
           this.timer = setInterval(() => void this.checkAndScale(), POLL_INTERVAL_MS);
+          console.log("[AUTOSCALER-DEBUG] New primary timer started, calling checkAndScale");
           void this.checkAndScale();
+        } else {
+          console.log("[AUTOSCALER-DEBUG] Failed to promote to primary");
         }
+      } else {
+        console.log("[AUTOSCALER-DEBUG] Primary still active, remaining in standby");
       }
     } catch (error) {
+      console.log("[AUTOSCALER-DEBUG] Exception in monitorPrimary:", error);
       logger.error("[autoscaler-v2] failed to monitor primary", {
         error: formatError(error)
       });
