@@ -7,6 +7,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    env:
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_USER: ${{ secrets.VPS_USER }}
 
     steps:
       - name: Checkout code
@@ -15,28 +18,32 @@ jobs:
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
           echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -H 143.198.185.76 >> ~/.ssh/known_hosts
 
       - name: Deploy to VPS
+        env:
+          REMOTE_DIR: "~/signalcast-ingestor"
         run: |
-          ssh -i ~/.ssh/id_ed25519 root@143.198.185.76 "
-            cd ~/signalcast-ingestor &&
-            echo '🔄 Pulling latest changes...' &&
-            git pull &&
-            echo '📦 Installing dependencies...' &&
-            pnpm install &&
-            echo '🏗️ Building V2 architecture...' &&
-            pnpm run build &&
-            echo '⏹️ Stopping all processes...' &&
-            pm2 stop all || true &&
-            pm2 delete all || true &&
-            echo '🚀 Starting V2 architecture...' &&
-            pm2 start pm2.config.js &&
-            echo '💾 Saving process list...' &&
-            pm2 save &&
-            echo '📊 Showing process status...' &&
-            pm2 list &&
-            echo '✅ Deployment complete!'
-          "
+          ssh -i ~/.ssh/id_ed25519 "$VPS_USER@$VPS_HOST" 'bash -s' <<'EOF'
+          set -euo pipefail
+          cd ~/signalcast-ingestor
+          echo '🔄 Pulling latest changes...'
+          git pull --ff-only
+          echo '📦 Installing dependencies...'
+          pnpm install --frozen-lockfile
+          echo '🏗️ Building application...'
+          pnpm run build
+          echo '🚀 Restarting PM2 ecosystem...'
+          pm2 delete all || true
+          pm2 start ecosystem.config.js --env production
+          pm2 save
+          echo '📊 PM2 status:'
+          pm2 list
+          echo '✅ Deployment complete!'
+          EOF
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/id_ed25519

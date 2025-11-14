@@ -1,0 +1,365 @@
+{
+  "name": "signalcast-ingestor",
+  "version": "1.0.0",
+  "description": "SignalCast Data Ingestion System - PM2 Deployment Configuration",
+  "author": "SignalCast Team",
+  "license": "MIT",
+
+  "deployment": {
+    "production": {
+      "user": "deploy",
+      "host": ["your-production-server.com"],
+      "ref": "origin/main",
+      "repo": "git@github.com:your-org/signalcast-ingestor.git",
+      "path": "/var/www/signalcast-ingestor",
+      "pre-deploy-local": "",
+      "post-deploy": "npm install && npm run build && pm2 reload ecosystem.config.js --env production",
+      "pre-setup": "apt-get update && apt-get install -y build-essential && npm install -g pm2 typescript ts-node",
+      "ssh_options": "StrictHostKeyChecking=no",
+      "env": {
+        "NODE_ENV": "production",
+        "PM2_HOME": "/var/www/signalcast-ingestor/.pm2"
+      }
+    },
+
+    "staging": {
+      "user": "deploy",
+      "host": ["your-staging-server.com"],
+      "ref": "origin/develop",
+      "repo": "git@github.com:your-org/signalcast-ingestor.git",
+      "path": "/var/www/signalcast-ingestor-staging",
+      "post-deploy": "npm install && npm run build && pm2 reload ecosystem.config.js --env staging",
+      "pre-setup": "npm install -g pm2 typescript ts-node",
+      "env": {
+        "NODE_ENV": "staging",
+        "PM2_HOME": "/var/www/signalcast-ingestor-staging/.pm2"
+      }
+    }
+  },
+
+  "scaling": {
+    "production": {
+      "cpu_intensive": {
+        "instances": "max",
+        "exec_mode": "cluster",
+        "memory_limit": "256M"
+      },
+      "io_intensive": {
+        "instances": 2,
+        "exec_mode": "fork",
+        "memory_limit": "512M"
+      },
+      "control": {
+        "instances": 1,
+        "exec_mode": "fork",
+        "memory_limit": "256M"
+      }
+    },
+
+    "staging": {
+      "cpu_intensive": {
+        "instances": 1,
+        "exec_mode": "fork",
+        "memory_limit": "256M"
+      },
+      "io_intensive": {
+        "instances": 1,
+        "exec_mode": "fork",
+        "memory_limit": "256M"
+      },
+      "control": {
+        "instances": 1,
+        "exec_mode": "fork",
+        "memory_limit": "128M"
+      }
+    }
+  },
+
+  "monitoring": {
+    "production": {
+      "pm2_monitoring": true,
+      "log_rotation": true,
+      "log_retention_days": 30,
+      "metrics_collection": true,
+      "health_checks": true,
+      "alerting": {
+        "memory_threshold": 80,
+        "cpu_threshold": 85,
+        "restart_threshold": 5
+      }
+    },
+
+    "staging": {
+      "pm2_monitoring": false,
+      "log_rotation": true,
+      "log_retention_days": 7,
+      "metrics_collection": false,
+      "health_checks": true
+    }
+  },
+
+  "health_checks": {
+    "endpoints": [
+      {
+        "name": "main_orchestrator",
+        "path": "/health",
+        "port": 3000,
+        "expected_status": 200,
+        "timeout": 5000
+      },
+      {
+        "name": "websocket_controller",
+        "path": "/ws-health",
+        "port": 8082,
+        "expected_status": 200,
+        "timeout": 5000
+      }
+    ],
+    "checks": [
+      {
+        "name": "database_connection",
+        "command": "npm run health:db",
+        "interval": 60000,
+        "timeout": 10000
+      },
+      {
+        "name": "redis_connection",
+        "command": "npm run health:redis",
+        "interval": 60000,
+        "timeout": 5000
+      },
+      {
+        "name": "queue_depth",
+        "command": "npm run health:queues",
+        "interval": 30000,
+        "timeout": 5000
+      }
+    ]
+  },
+
+  "backup": {
+    "production": {
+      "database": {
+        "enabled": true,
+        "schedule": "0 2 * * *",
+        "retention_days": 30,
+        "storage": "s3://signalcast-backups/db"
+      },
+      "logs": {
+        "enabled": true,
+        "schedule": "0 3 * * *",
+        "retention_days": 90,
+        "storage": "s3://signalcast-backups/logs"
+      },
+      "configuration": {
+        "enabled": true,
+        "schedule": "0 4 * * *",
+        "retention_days": 180,
+        "storage": "s3://signalcast-backups/config"
+      }
+    },
+
+    "staging": {
+      "database": {
+        "enabled": true,
+        "schedule": "0 6 * * *",
+        "retention_days": 7,
+        "storage": "local"
+      },
+      "logs": {
+        "enabled": false
+      },
+      "configuration": {
+        "enabled": false
+      }
+    }
+  },
+
+  "security": {
+    "production": {
+      "firewall": {
+        "allowed_ports": [80, 443, 8080, 8081, 8082],
+        "allowed_ips": ["0.0.0.0/0"],
+        "rate_limiting": {
+          "enabled": true,
+          "requests_per_minute": 1000,
+          "burst_size": 100
+        }
+      },
+      "ssl": {
+        "enabled": true,
+        "certificate_path": "/etc/ssl/certs/signalcast.crt",
+        "private_key_path": "/etc/ssl/private/signalcast.key"
+      },
+      "authentication": {
+        "api_keys_required": true,
+        "jwt_secret_rotation_days": 30
+      }
+    },
+
+    "staging": {
+      "firewall": {
+        "allowed_ports": [3000, 8080, 8081, 8082],
+        "allowed_ips": ["0.0.0.0/0"],
+        "rate_limiting": {
+          "enabled": false
+        }
+      },
+      "ssl": {
+        "enabled": false
+      },
+      "authentication": {
+        "api_keys_required": false,
+        "jwt_secret_rotation_days": 7
+      }
+    }
+  },
+
+  "performance": {
+    "production": {
+      "caching": {
+        "redis_cache_enabled": true,
+        "memory_cache_size": "256MB",
+        "cache_ttl_seconds": 300
+      },
+      "connection_pooling": {
+        "database_pool_size": 20,
+        "redis_pool_size": 10,
+        "http_keep_alive": true
+      },
+      "compression": {
+        "enabled": true,
+        "level": 6
+      },
+      "optimizations": {
+        "node_options": "--max-old-space-size=2048 --optimize-for-size",
+        "gc_optimization": true
+      }
+    },
+
+    "staging": {
+      "caching": {
+        "redis_cache_enabled": true,
+        "memory_cache_size": "64MB",
+        "cache_ttl_seconds": 60
+      },
+      "connection_pooling": {
+        "database_pool_size": 5,
+        "redis_pool_size": 3,
+        "http_keep_alive": true
+      },
+      "compression": {
+        "enabled": true,
+        "level": 1
+      },
+      "optimizations": {
+        "node_options": "--max-old-space-size=1024",
+        "gc_optimization": false
+      }
+    }
+  },
+
+  "alerts": {
+    "production": {
+      "slack_webhook": "${SLACK_WEBHOOK_URL}",
+      "email_recipients": ["ops-team@signalcast.com"],
+      "pagerduty_service_key": "${PAGERDUTY_SERVICE_KEY}",
+      "conditions": {
+        "high_memory_usage": {
+          "threshold": 85,
+          "duration_seconds": 300
+        },
+        "high_cpu_usage": {
+          "threshold": 90,
+          "duration_seconds": 180
+        },
+        "process_restarts": {
+          "threshold": 5,
+          "window_minutes": 10
+        },
+        "queue_backlog": {
+          "threshold": 10000,
+          "duration_seconds": 60
+        },
+        "database_errors": {
+          "threshold": 10,
+          "window_minutes": 5
+        }
+      }
+    },
+
+    "staging": {
+      "slack_webhook": "${SLACK_WEBHOOK_URL_STAGING}",
+      "email_recipients": ["dev-team@signalcast.com"],
+      "conditions": {
+        "high_memory_usage": {
+          "threshold": 90,
+          "duration_seconds": 600
+        },
+        "high_cpu_usage": {
+          "threshold": 95,
+          "duration_seconds": 300
+        }
+      }
+    }
+  },
+
+  "maintenance": {
+    "production": {
+      "restart_schedule": "0 2 * * *",
+      "log_rotation": "0 3 * * *",
+      "cache_cleanup": "0 4 * * 0",
+      "database_maintenance": "0 5 * * 0",
+      "security_updates": "0 6 * * 0"
+    },
+
+    "staging": {
+      "restart_schedule": "0 6 * * *",
+      "log_rotation": "0 7 * * *",
+      "cache_cleanup": "0 8 * * 0"
+    }
+  },
+
+  "disaster_recovery": {
+    "production": {
+      "failover_enabled": true,
+      "backup_region": "us-west-2",
+      "rto_minutes": 15,
+      "rpo_minutes": 5,
+      "manual_failover_steps": [
+        "Stop application on primary server",
+        "Promote standby database",
+        "Update DNS to point to backup server",
+        "Start application on backup server",
+        "Verify all services are running",
+        "Monitor system stability"
+      ]
+    },
+
+    "staging": {
+      "failover_enabled": false,
+      "backup_region": "local"
+    }
+  },
+
+  "compliance": {
+    "production": {
+      "gdpr_compliance": true,
+      "data_encryption": true,
+      "audit_logging": true,
+      "access_logging": true,
+      "data_retention_policy": {
+        "user_data_days": 365,
+        "analytics_data_days": 90,
+        "logs_days": 180
+      }
+    },
+
+    "staging": {
+      "gdpr_compliance": false,
+      "data_encryption": false,
+      "audit_logging": true,
+      "access_logging": true
+    }
+  }
+}

@@ -1,474 +1,892 @@
-import WebSocket from "ws";
-import logger, { formatError } from "../lib/logger";
-import { polymarketConfig, PolymarketMarket, polymarketClient } from "../config/polymarket";
-import { pushUpdate } from "../queues/updates.queue";
-import { normalizeTick, NormalizedTick } from "../utils/normalizeTick";
-import { sleep } from "../lib/retry";
-import { heartbeatMonitor } from "./heartbeat";
-import { WORKERS, QUEUES } from "../utils/constants";
-import { redisAvailable, redis } from "../lib/redis";
-import { settings } from "../config/settings";
-import { politicsFilter } from "../utils/politicsFilter";
-import { bootstrap } from "../lib/bootstrap";
+/**
+ * Market Channel WebSocket Handler
+ * Handles real-time market data from Polymarket WebSocket API
+ * Processes price updates, trades, and market state changes
+ */
 
-const WORKER_NAME = WORKERS.marketChannel;
+import { Logger, LoggerFactory, LogCategory } from '../lib/logger';
+import { TicksQueue } from '../queues';
+import { type TickQueueMessage, queueMessageGuards } from '../queues/types';
+import { normalizeTick } from '../utils/normalizeTick';
+import {
+  PolymarketWebSocketHandler,
+  type RealtimeTick,
+  type WsSubscription,
+  type ConnectionStats,
+  type WsMessage
+} from '../services/wss-handlers';
+import { WS_CONFIG, WS_CHANNELS } from '../config/polymarket';
 
-// How many asset IDs per subscription message to avoid huge payloads
-const MAX_ASSETS_PER_SUBSCRIPTION = 400;
-
-// How often we allow a "tick" heartbeat (ms)
-const TICK_HEARTBEAT_INTERVAL_MS = 2000;
-
-const authPayload =
-  process.env.POLYMARKET_API_KEY &&
-  process.env.POLYMARKET_SECRET &&
-  process.env.POLYMARKET_PASSPHRASE
-    ? {
-        apiKey: process.env.POLYMARKET_API_KEY,
-        secret: process.env.POLYMARKET_SECRET,
-        passphrase: process.env.POLYMARKET_PASSPHRASE
-      }
-    : null;
-
-export interface MarketChannelSubscription extends Record<string, unknown> {
-  type: "market" | "user";
-  assets_ids?: string[];
-  markets?: string[];
-  auth?: Record<string, string>;
+/**
+ * Market channel configuration
+ */
+interface MarketChannelConfig {
+  maxSubscriptions: number;
+  subscriptionTimeoutMs: number;
+  tickProcessingTimeoutMs: number;
+  maxRetries: number;
+  retryDelayMs: number;
+  enableTickDeduplication: boolean;
+  deduplicationWindowMs: number;
+  deduplicationCacheMaxSize: number;
+  deduplicationCleanupIntervalMs: number;
+  enableTickAggregation: boolean;
+  aggregationWindowMs: number;
+  enablePersistedSubscriptions: boolean;
+  healthCheckIntervalMs: number;
 }
 
-export class MarketChannelWorker {
-  private socket: WebSocket | null = null;
-  private reconnectDelay = 5_000;
-  private shouldRun = false;
-  private assetIds: string[] = [];
-  private pingTimer: NodeJS.Timeout | null = null;
+/**
+ * Market subscription filters
+ */
+interface MarketSubscriptionFilter {
+  marketIds?: string[];
+  eventIds?: string[];
+  categories?: string[];
+  minLiquidity?: number;
+  minVolume?: number;
+  activeOnly?: boolean;
+}
 
-  private initializing = false;
-  private lastTickHeartbeatAt = 0;
+/**
+ * Tick deduplication entry
+ */
+interface TickDeduplicationEntry {
+  marketId: string;
+  timestamp: number;
+  price: number;
+  sequenceId?: number;
+  tickType: string;
+}
 
-  constructor() {}
+/**
+ * Market channel statistics
+ */
+interface MarketChannelStats {
+  totalConnections: number;
+  activeConnections: number;
+  totalSubscriptions: number;
+  activeSubscriptions: number;
+  ticksReceived: number;
+  ticksProcessed: number;
+  ticksQueued: number;
+  duplicateTicksFiltered: number;
+  errorsCount: number;
+  reconnections: number;
+  uptime: number;
+  lastTickAt?: string;
+  lastSubscriptionAt?: string;
+  averageProcessingTime: number;
+  tickTypes: Record<string, number>;
+  connectionStats: ConnectionStats;
+}
 
-  start(): void {
-    if (this.shouldRun) return;
-    this.shouldRun = true;
-    heartbeatMonitor.beat(WORKER_NAME, { state: "initializing" });
-    void this.initializeAndConnect();
+/**
+ * Market channel WebSocket handler class
+ */
+export class MarketChannelWebSocketHandler {
+  private logger: Logger;
+  private config: MarketChannelConfig;
+  private wsHandler: PolymarketWebSocketHandler;
+  private ticksQueue: TicksQueue;
+  private isRunning: boolean = false;
+  private startTime: number;
+  private stats: MarketChannelStats;
+  private deduplicationCache: Map<string, TickDeduplicationEntry> = new Map();
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private deduplicationCleanupTimer: NodeJS.Timeout | null = null;
+  private lastDeduplicationCleanup: number = 0;
+
+  constructor(
+    ticksQueue: TicksQueue,
+    wsHandler?: PolymarketWebSocketHandler,
+    config?: Partial<MarketChannelConfig>
+  ) {
+    this.logger = LoggerFactory.getWorkerLogger('wss-market-channel', process.pid.toString());
+    this.ticksQueue = ticksQueue;
+    this.wsHandler = wsHandler || new PolymarketWebSocketHandler();
+    this.startTime = Date.now();
+
+    // Default configuration
+    this.config = {
+      maxSubscriptions: 1000,
+      subscriptionTimeoutMs: 30000,
+      tickProcessingTimeoutMs: 5000,
+      maxRetries: 3,
+      retryDelayMs: 1000,
+      enableTickDeduplication: true,
+      deduplicationWindowMs: 1000, // 1 second
+      deduplicationCacheMaxSize: 10000, // Maximum 10,000 entries in cache
+      deduplicationCleanupIntervalMs: 30000, // Clean up every 30 seconds
+      enableTickAggregation: false,
+      aggregationWindowMs: 60000, // 1 minute
+      enablePersistedSubscriptions: true,
+      healthCheckIntervalMs: 30000,
+      ...config,
+    };
+
+    // Initialize statistics
+    this.stats = {
+      totalConnections: 0,
+      activeConnections: 0,
+      totalSubscriptions: 0,
+      activeSubscriptions: 0,
+      ticksReceived: 0,
+      ticksProcessed: 0,
+      ticksQueued: 0,
+      duplicateTicksFiltered: 0,
+      errorsCount: 0,
+      reconnections: 0,
+      uptime: 0,
+      averageProcessingTime: 0,
+      tickTypes: {},
+      connectionStats: this.wsHandler.getStats(),
+    };
+
+    this.setupWebSocketEventHandlers();
+    this.setupGracefulShutdown();
+    this.logger.info('Market channel WebSocket handler initialized', {
+      config: this.config,
+    });
   }
 
-  stop(): void {
-    this.shouldRun = false;
-    this.stopPing();
-
-    if (this.socket) {
-      this.socket.removeAllListeners();
-      try {
-        this.socket.close();
-      } catch {
-        // ignore
-      }
-      // Forcefully terminate if still hanging
-      try {
-        this.socket.terminate();
-      } catch {
-        // ignore
-      }
-      this.socket = null;
+  /**
+   * Start the market channel handler
+   */
+  async start(): Promise<void> {
+    if (this.isRunning) {
+      this.logger.warn('Market channel WebSocket handler is already running');
+      return;
     }
 
-    heartbeatMonitor.markIdle(WORKER_NAME, { state: "stopped" });
-  }
-
-  private async initializeAndConnect(): Promise<void> {
-    if (this.initializing) return;
-    this.initializing = true;
+    this.logger.info('Starting market channel WebSocket handler');
+    this.isRunning = true;
+    this.startTime = Date.now();
 
     try {
-      await this.refreshAssetIds();
-    } catch (error) {
-      logger.error(`${WORKER_NAME} failed to load asset ids`, { error: formatError(error) });
-    } finally {
-      this.initializing = false;
-    }
+      // Initialize WebSocket handler
+      await this.wsHandler.initialize();
 
-    if (!this.shouldRun) return;
-    this.connect();
+      // Subscribe to default channels
+      await this.subscribeToDefaultChannels();
+
+      // Start health monitoring
+      this.startHealthMonitoring();
+
+      // Start deduplication cleanup timer
+      this.startDeduplicationCleanup();
+
+      // Send ready signal if running under PM2
+      if (process.send) {
+        process.send('ready');
+      }
+
+      this.logger.info('Market channel WebSocket handler started successfully');
+
+    } catch (error) {
+      this.logger.error('Failed to start market channel WebSocket handler', {
+        error: error as Error,
+      });
+      this.isRunning = false;
+      throw error;
+    }
   }
 
-  private connect(): void {
-    if (!this.shouldRun) return;
+  /**
+   * Stop the market channel handler
+   */
+  async stop(): Promise<void> {
+    if (!this.isRunning) {
+      this.logger.warn('Market channel WebSocket handler is not running');
+      return;
+    }
 
-    heartbeatMonitor.beat(WORKER_NAME, { state: "connecting" });
+    this.logger.info('Stopping market channel WebSocket handler');
+    this.isRunning = false;
 
-    const url = `${polymarketConfig.wsBaseUrl}${process.env.POLYMARKET_WS_PATH || "/prices"}`;
-    logger.info(`${WORKER_NAME} connecting`, { url });
+    try {
+      // Stop health monitoring
+      if (this.healthCheckTimer) {
+        clearInterval(this.healthCheckTimer);
+        this.healthCheckTimer = null;
+      }
 
-    this.socket = new WebSocket(url);
+      // Stop deduplication cleanup timer
+      if (this.deduplicationCleanupTimer) {
+        clearInterval(this.deduplicationCleanupTimer);
+        this.deduplicationCleanupTimer = null;
+      }
 
-    this.socket.on("open", () => {
-      logger.info(`${WORKER_NAME} connected`);
-      this.reconnectDelay = 5_000;
-      heartbeatMonitor.beat(WORKER_NAME, { state: "connected" });
+      // Disconnect WebSocket
+      this.wsHandler.disconnect();
 
-      // On every (re)connect, refresh asset IDs then subscribe
-      void this.refreshAssetIdsAndSubscribe();
-      this.startPing();
-    });
+      // Clean up caches
+      this.deduplicationCache.clear();
 
-    this.socket.on("message", async (raw) => {
-      try {
-        const text = raw.toString();
+      this.logger.info('Market channel WebSocket handler stopped', {
+        finalStats: this.getStats(),
+      });
 
-        // Legacy string ping/pong from server (just in case)
-        if (text === "PING") {
-          this.send({ type: "pong" });
-          heartbeatMonitor.beat(WORKER_NAME, { state: "pong" });
-          return;
-        }
-        if (text === "PONG") {
-          return;
-        }
+    } catch (error) {
+      this.logger.error('Error during shutdown', {
+        error: error as Error,
+      });
+    }
+  }
 
-        const message = JSON.parse(text);
+  /**
+   * Subscribe to default channels
+   */
+  private async subscribeToDefaultChannels(): Promise<void> {
+    try {
+      // Subscribe to market data updates
+      const marketDataSubscription = this.wsHandler.subscribe(WS_CHANNELS.MARKET_DATA, {
+        active: true,
+      });
 
-        // JSON ping from Polymarket
-        if (message?.type === "ping") {
-          this.send({ type: "pong" });
-          heartbeatMonitor.beat(WORKER_NAME, { state: "pong" });
-          return;
-        }
+      // Subscribe to price updates
+      const priceUpdatesSubscription = this.wsHandler.subscribe(WS_CHANNELS.PRICE_UPDATES, {
+        min_liquidity: 1000, // Only markets with significant liquidity
+      });
 
-        // Error payload from server (e.g. auth/format error)
-        if (message?.error) {
-          logger.error(`${WORKER_NAME} received error from server`, {
-            error: message.error,
-            data: message.data ?? null
+      // Subscribe to trade data
+      const tradesSubscription = this.wsHandler.subscribe(WS_CHANNELS.TRADES, {
+        min_size: 100, // Only significant trades
+      });
+
+      // Subscribe to ticker data for overview
+      const tickerSubscription = this.wsHandler.subscribe(WS_CHANNELS.TICKER, {
+        categories: ['sports', 'politics', 'business', 'technology'],
+      });
+
+      this.stats.totalSubscriptions += 4;
+      this.stats.activeSubscriptions = 4;
+      this.stats.lastSubscriptionAt = new Date().toISOString();
+
+      this.logger.info('Subscribed to default market channels', {
+        subscriptions: [marketDataSubscription, priceUpdatesSubscription, tradesSubscription, tickerSubscription],
+      });
+
+    } catch (error) {
+      this.logger.error('Failed to subscribe to default channels', {
+        error: error as Error,
+      });
+      throw error;
+    }
+  }
+
+  /**
+   * Subscribe to specific markets
+   */
+  async subscribeToMarkets(filter: MarketSubscriptionFilter): Promise<string[]> {
+    const subscriptionIds: string[] = [];
+
+    try {
+      // Build subscription filters
+      const filters: Record<string, any> = {};
+
+      if (filter.marketIds && filter.marketIds.length > 0) {
+        filters['market_ids'] = filter.marketIds;
+      }
+
+      if (filter.eventIds && filter.eventIds.length > 0) {
+        filters['event_ids'] = filter.eventIds;
+      }
+
+      if (filter.categories && filter.categories.length > 0) {
+        filters['categories'] = filter.categories;
+      }
+
+      if (filter.minLiquidity) {
+        filters['min_liquidity'] = filter.minLiquidity;
+      }
+
+      if (filter.minVolume) {
+        filters['min_volume'] = filter.minVolume;
+      }
+
+      if (filter.activeOnly !== undefined) {
+        filters['active_only'] = filter.activeOnly;
+      }
+
+      // Subscribe to relevant channels
+      const channels = [WS_CHANNELS.MARKET_DATA, WS_CHANNELS.PRICE_UPDATES, WS_CHANNELS.TRADES];
+
+      for (const channel of channels) {
+        try {
+          const subscriptionId = this.wsHandler.subscribe(channel, filters);
+          subscriptionIds.push(subscriptionId);
+          this.stats.totalSubscriptions++;
+        } catch (error) {
+          this.logger.error('Failed to subscribe to channel', {
+            channel,
+            error: error as Error,
           });
-          heartbeatMonitor.beat(WORKER_NAME, { state: "error" });
-          return;
         }
+      }
 
-        if (message?.type !== "channel_data" || !message?.data) {
-          return;
-        }
+      this.stats.activeSubscriptions = this.wsHandler.getSubscriptions().length;
+      this.stats.lastSubscriptionAt = new Date().toISOString();
 
-        const marketPayload = this.extractMarket(message);
-        if (!marketPayload?.id) return;
+      this.logger.info('Subscribed to markets', {
+        filter,
+        subscriptionIds,
+        totalSubscriptions: this.stats.totalSubscriptions,
+      });
 
-        const tick = normalizeTick(this.toMarket(marketPayload));
+    } catch (error) {
+      this.logger.error('Failed to subscribe to markets', {
+        filter,
+        error: error as Error,
+      });
+      throw error;
+    }
 
-        if (await this.shouldEnqueueTick()) {
-          await pushUpdate("tick", tick);
-        } else {
-          this.logTick(tick);
-        }
+    return subscriptionIds;
+  }
 
-        this.beatTick();
+  /**
+   * Unsubscribe from specific markets
+   */
+  async unsubscribeFromMarkets(subscriptionIds: string[]): Promise<void> {
+    for (const subscriptionId of subscriptionIds) {
+      try {
+        this.wsHandler.unsubscribe(subscriptionId);
+        this.stats.totalSubscriptions--;
       } catch (error) {
-        logger.warn(`${WORKER_NAME} failed to process tick`, { error: formatError(error) });
+        this.logger.error('Failed to unsubscribe', {
+          subscriptionId,
+          error: error as Error,
+        });
+      }
+    }
+
+    this.stats.activeSubscriptions = this.wsHandler.getSubscriptions().length;
+
+    this.logger.info('Unsubscribed from markets', {
+      subscriptionIds,
+      activeSubscriptions: this.stats.activeSubscriptions,
+    });
+  }
+
+  /**
+   * Setup WebSocket event handlers
+   */
+  private setupWebSocketEventHandlers(): void {
+    this.wsHandler.on('data', async (message: WsMessage) => {
+      if (this.isRunning) {
+        await this.handleWebSocketMessage(message);
       }
     });
 
-    this.socket.on("error", (error) => {
-      logger.error(`${WORKER_NAME} socket error`, { error: formatError(error) });
-    });
-
-    this.socket.on("close", async (code, reason) => {
-      logger.warn(`${WORKER_NAME} connection closed`, {
-        code,
-        reason: reason?.toString()
+    this.wsHandler.on('error', (error: Error) => {
+      this.logger.error('WebSocket error', {
+        error: error.message,
+        stack: error.stack,
       });
-      heartbeatMonitor.markIdle(WORKER_NAME, { state: "disconnected" });
-      this.stopPing();
+      this.stats.errorsCount++;
+    });
 
-      if (!this.shouldRun) return;
+    this.wsHandler.on('disconnected', () => {
+      this.logger.warn('WebSocket disconnected');
+      this.stats.activeConnections = Math.max(0, this.stats.activeConnections - 1);
+      this.stats.reconnections++;
+    });
 
-      await sleep(this.reconnectDelay);
-      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 60_000);
-      heartbeatMonitor.beat(WORKER_NAME, { state: "reconnecting" });
-      this.connect();
+    this.wsHandler.on('connected', () => {
+      this.logger.info('WebSocket connected');
+      this.stats.activeConnections++;
+      this.stats.totalConnections++;
+    });
+
+    this.wsHandler.on('subscription_ack', (message: WsMessage) => {
+      this.logger.debug('Subscription acknowledged', {
+        subscriptionId: message.id,
+        channel: message.channel,
+      });
     });
   }
 
-  private extractMarket(message: any): Partial<PolymarketMarket> | null {
-    if (!message) return null;
+  /**
+   * Handle WebSocket message
+   */
+  private async handleWebSocketMessage(message: WsMessage): Promise<void> {
+    const processingStartTime = Date.now();
 
-    const payload = message.data ?? message;
+    try {
+      this.stats.ticksReceived++;
 
-    // Prefer explicit market key
-    const maybeMarket = payload.market ?? payload.data?.market ?? payload;
+      if (!message.data) {
+        return;
+      }
 
-    // Be strict: ensure it looks like a market
-    if (!maybeMarket || typeof maybeMarket !== "object") return null;
-    if (!maybeMarket.id) return null;
+      // Process different message types
+      if (message.channel === WS_CHANNELS.PRICE_UPDATES || message.channel === WS_CHANNELS.MARKET_DATA) {
+        await this.processPriceUpdate(message.data);
+      } else if (message.channel === WS_CHANNELS.TRADES) {
+        await this.processTradeData(message.data);
+      } else if (message.channel === WS_CHANNELS.TICKER) {
+        await this.processTickerData(message.data);
+      }
 
-    return maybeMarket as Partial<PolymarketMarket>;
+      // Update processing statistics
+      const processingTime = Date.now() - processingStartTime;
+      this.updateProcessingStats(processingTime);
+
+    } catch (error) {
+      this.stats.errorsCount++;
+      this.logger.error('Failed to handle WebSocket message', {
+        error: error as Error,
+        message,
+      });
+    }
   }
 
-  private toMarket(payload: Partial<PolymarketMarket>): PolymarketMarket {
+  /**
+   * Process price update data
+   */
+  private async processPriceUpdate(data: any): Promise<void> {
+    const tick = this.normalizeTickData(data, 'price_update');
+    if (!tick) {
+      return;
+    }
+
+    await this.processTick(tick);
+  }
+
+  /**
+   * Process trade data
+   */
+  private async processTradeData(data: any): Promise<void> {
+    const tick = this.normalizeTickData(data, 'trade');
+    if (!tick) {
+      return;
+    }
+
+    await this.processTick(tick);
+  }
+
+  /**
+   * Process ticker data
+   */
+  private async processTickerData(data: any): Promise<void> {
+    const tick = this.normalizeTickData(data, 'price_update');
+    if (!tick) {
+      return;
+    }
+
+    await this.processTick(tick);
+  }
+
+  /**
+   * Normalize tick data
+   */
+  private normalizeTickData(data: any, tickType: string): RealtimeTick | null {
+    if (!data.marketId) {
+      this.logger.debug('Tick missing market ID', { data });
+      return null;
+    }
+
     return {
-      id: payload.id!,
-      question: payload.question || "",
-      description: payload.description ?? null,
-      slug: payload.slug || payload.id!,
-      startDate: payload.startDate || null,
-      endDate: payload.endDate || null,
-      liquidity: Number(payload.liquidity ?? 0),
-      volume: Number(payload.volume ?? 0),
-      createdAt: payload.createdAt || new Date().toISOString(),
-      isActive: payload.isActive ?? true,
-      closed: payload.closed ?? false,
-      archived: payload.archived ?? false,
-      restricted: payload.restricted ?? false,
-      approved: payload.approved ?? true,
-      currentPrice: payload.currentPrice ?? null,
-      lastTradePrice: payload.lastTradePrice ?? null,
-      bestBid: payload.bestBid ?? null,
-      bestAsk: payload.bestAsk ?? null,
-      spread: payload.spread ?? null,
-      status: payload.status || "active",
-      resolvedAt: payload.resolvedAt || null,
-      outcomes: payload.outcomes || [],
-      category: payload.category,
-      tags: payload.tags,
-      marketMakerAddress: payload.marketMakerAddress,
-      imageUrl: payload.imageUrl,
-      event: payload.event
+      marketId: data.marketId,
+      price: Number(data.price) || 0,
+      bestBid: data.bestBid ? Number(data.bestBid) : undefined,
+      bestAsk: data.bestAsk ? Number(data.bestAsk) : undefined,
+      lastTradePrice: data.lastTradePrice ? Number(data.lastTradePrice) : undefined,
+      liquidity: Number(data.liquidity) || 0,
+      volume24h: data.volume24h ? Number(data.volume24h) : undefined,
+      priceChange: data.priceChange ? Number(data.priceChange) : undefined,
+      priceChangePercent: data.priceChangePercent ? Number(data.priceChangePercent) : undefined,
+      timestamp: data.timestamp || Date.now(),
+      sequenceId: data.sequenceId,
+      tradeId: data.tradeId,
+      tradeSize: data.tradeSize ? Number(data.tradeSize) : undefined,
+      side: data.side,
+      tickType: tickType as any,
+      marketState: data.marketState || 'open',
     };
   }
 
-private async shouldEnqueueTick(): Promise<boolean> {
-  // If bootstrap not done, don’t enqueue ticks yet
-  const eventsDone = await bootstrap.isDone("events_done");
-  const marketsDone = await bootstrap.isDone("markets_done");
-  if (!eventsDone || !marketsDone) return false;
+  /**
+   * Process tick data
+   */
+  private async processTick(tick: RealtimeTick): Promise<void> {
+    // Apply deduplication if enabled
+    if (this.config.enableTickDeduplication && this.isDuplicateTick(tick)) {
+      this.stats.duplicateTicksFiltered++;
+      return;
+    }
 
-  if (!settings.redisEnabled || !redisAvailable) return false;
+    // Normalize tick
+    const { tick: normalizedTick, validation } = normalizeTick({
+      marketId: tick.marketId,
+      price: tick.price,
+      bestBid: tick.bestBid,
+      bestAsk: tick.bestAsk,
+      lastTradePrice: tick.lastTradePrice,
+      liquidity: tick.liquidity,
+      volume24h: tick.volume24h,
+      priceChange: tick.priceChange,
+      priceChangePercent: tick.priceChangePercent,
+      timestamp: new Date(tick.timestamp).toISOString(),
+      sequenceId: tick.sequenceId,
+      tradeId: tick.tradeId,
+      tradeSize: tick.tradeSize,
+      side: tick.side,
+      tickType: tick.tickType,
+      marketState: tick.marketState,
+    });
 
-  try {
-    const backlog = await redis.llen(QUEUES.ticks);
-    if (backlog >= settings.tickQueueBacklogThreshold) {
-      logger.warn(
-        `${WORKER_NAME} dropping ticks due to backlog`,
-        { backlog },
-      );
+    if (!validation.isValid) {
+      this.logger.debug('Tick validation failed', {
+        marketId: tick.marketId,
+        errors: validation.errors,
+      });
+      return;
+    }
+
+    // Create queue message
+    const tickMessage: TickQueueMessage = {
+      id: `tick_${tick.marketId}_${tick.timestamp}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: normalizedTick.timestamp,
+      marketId: normalizedTick.marketId,
+      price: normalizedTick.price,
+      bestBid: normalizedTick.bestBid,
+      bestAsk: normalizedTick.bestAsk,
+      liquidity: normalizedTick.liquidity,
+      volume24h: normalizedTick.volume24h,
+      priceChange: normalizedTick.priceChange,
+      priceChangePercent: normalizedTick.priceChangePercent,
+      sequenceId: normalizedTick.sequenceId,
+      tradeId: normalizedTick.tradeId,
+      tradeSize: normalizedTick.tradeSize,
+      side: normalizedTick.side,
+      tickType: normalizedTick.tickType,
+      marketState: normalizedTick.marketState,
+      source: 'polymarket-wss-market-channel',
+      version: '1.0.0',
+    };
+
+    // Validate message
+    if (!queueMessageGuards.isTickMessage(tickMessage)) {
+      this.logger.debug('Tick message validation failed', {
+        marketId: tick.marketId,
+      });
+      return;
+    }
+
+    // Queue the tick
+    await this.ticksQueue.addMessage(tickMessage);
+
+    this.stats.ticksProcessed++;
+    this.stats.ticksQueued++;
+    this.stats.lastTickAt = new Date().toISOString();
+
+    // Update tick type statistics
+    this.stats.tickTypes[tick.tickType] = (this.stats.tickTypes[tick.tickType] || 0) + 1;
+
+    // Add to deduplication cache if enabled
+    if (this.config.enableTickDeduplication) {
+      this.addToDeduplicationCache(tick);
+    }
+
+    this.logger.debug('Tick processed and queued', {
+      marketId: tick.marketId,
+      price: tick.price,
+      tickType: tick.tickType,
+    });
+  }
+
+  /**
+   * Check if tick is a duplicate
+   */
+  private isDuplicateTick(tick: RealtimeTick): boolean {
+    const key = `${tick.marketId}_${tick.tickType}`;
+    const now = Date.now();
+
+    const existing = this.deduplicationCache.get(key);
+    if (!existing) {
       return false;
     }
-  } catch (e) {
-    logger.warn(`${WORKER_NAME} failed to read tick backlog`, {
-      error: formatError(e),
-    });
+
+    // Check if within deduplication window
+    if (now - existing.timestamp > this.config.deduplicationWindowMs) {
+      return false;
+    }
+
+    // Check if same price and sequence
+    return existing.price === tick.price && existing.sequenceId === tick.sequenceId;
   }
 
-  return true;
-}
-
-  private logTick(tick: NormalizedTick): void {
-    console.log(`[${WORKER_NAME}]`, "tick (redis disabled)", {
-      market: tick.market_polymarket_id,
-      price: tick.price,
-      bestBid: tick.best_bid,
-      bestAsk: tick.best_ask,
-      lastTradePrice: tick.last_trade_price,
-      capturedAt: tick.captured_at
-    });
-  }
-
-  private beatTick(): void {
+  /**
+   * Add tick to deduplication cache with size management
+   */
+  private addToDeduplicationCache(tick: RealtimeTick): void {
+    const key = `${tick.marketId}_${tick.tickType}`;
     const now = Date.now();
-    if (now - this.lastTickHeartbeatAt < TICK_HEARTBEAT_INTERVAL_MS) return;
-    this.lastTickHeartbeatAt = now;
 
-    heartbeatMonitor.beat(WORKER_NAME, { state: "tick" });
+    this.deduplicationCache.set(key, {
+      marketId: tick.marketId,
+      timestamp: now,
+      price: tick.price,
+      sequenceId: tick.sequenceId,
+      tickType: tick.tickType,
+    });
+
+    // Check cache size and evict if necessary
+    if (this.deduplicationCache.size > this.config.deduplicationCacheMaxSize) {
+      this.evictOldestCacheEntries();
+    }
+
+    // Clean up old entries periodically (not on every insert)
+    if (now - this.lastDeduplicationCleanup > this.config.deduplicationCleanupIntervalMs) {
+      this.cleanupDeduplicationCache();
+    }
   }
 
-  private async refreshAssetIdsAndSubscribe(): Promise<void> {
-    try {
-      await this.refreshAssetIds();
-      this.subscribe();
-    } catch (error) {
-      logger.error(`${WORKER_NAME} failed to refresh asset ids on connect`, {
-        error: formatError(error)
+  /**
+   * Evict oldest cache entries to maintain size limit
+   */
+  private evictOldestCacheEntries(): void {
+    const entriesToEvict = Math.floor(this.config.deduplicationCacheMaxSize * 0.2); // Remove 20%
+    const sortedEntries = Array.from(this.deduplicationCache.entries())
+      .sort(([, a], [, b]) => a.timestamp - b.timestamp);
+
+    for (let i = 0; i < entriesToEvict && i < sortedEntries.length; i++) {
+      this.deduplicationCache.delete(sortedEntries[i][0]);
+    }
+
+    this.logger.debug(`Evicted ${entriesToEvict} entries from deduplication cache`, {
+      cacheSize: this.deduplicationCache.size,
+      maxSize: this.config.deduplicationCacheMaxSize,
+    });
+  }
+
+  /**
+   * Clean up old deduplication entries efficiently
+   */
+  private cleanupDeduplicationCache(): void {
+    const now = Date.now();
+    const cutoff = now - this.config.deduplicationWindowMs;
+    const initialSize = this.deduplicationCache.size;
+    let evictedCount = 0;
+
+    // Batch delete expired entries
+    const keysToDelete: string[] = [];
+    for (const [key, entry] of this.deduplicationCache) {
+      if (entry.timestamp < cutoff) {
+        keysToDelete.push(key);
+        if (keysToDelete.length >= 1000) { // Process in batches of 1000
+          break;
+        }
+      }
+    }
+
+    // Delete the batch
+    for (const key of keysToDelete) {
+      this.deduplicationCache.delete(key);
+      evictedCount++;
+    }
+
+    this.lastDeduplicationCleanup = now;
+
+    if (evictedCount > 0) {
+      this.logger.debug(`Cleaned up ${evictedCount} expired entries from deduplication cache`, {
+        initialSize,
+        finalSize: this.deduplicationCache.size,
+        cutoff: new Date(cutoff).toISOString(),
       });
     }
   }
 
-  private subscribe(): void {
-    if (!this.assetIds.length) {
-      logger.warn(`${WORKER_NAME} no asset ids available, skipping subscription`);
-      return;
-    }
-
-    // Batch subscriptions to avoid huge payloads
-    const chunks: string[][] = [];
-    for (let i = 0; i < this.assetIds.length; i += MAX_ASSETS_PER_SUBSCRIPTION) {
-      chunks.push(this.assetIds.slice(i, i + MAX_ASSETS_PER_SUBSCRIPTION));
-    }
-
-    for (const chunk of chunks) {
-      const subscription: MarketChannelSubscription = {
-        type: "market",
-        assets_ids: chunk,
-        auth: authPayload ?? undefined
-      };
-      this.send(subscription);
-    }
-
-    logger.info(`${WORKER_NAME} sent market subscriptions`, {
-      assetCount: this.assetIds.length,
-      batchCount: chunks.length
-    });
-  }
-
-  private send(payload: Record<string, unknown> | string): void {
-    if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
-      logger.warn(`${WORKER_NAME} cannot send payload - socket not ready`);
-      return;
-    }
-
-    if (typeof payload === "string") {
-      this.socket.send(payload);
-      return;
-    }
-
-    this.socket.send(JSON.stringify(payload));
-  }
-
-  private startPing(): void {
-    if (this.pingTimer) return;
-
-    const interval = Number(process.env.POLYMARKET_WS_PING_INTERVAL_MS || 10_000);
-
-    this.pingTimer = setInterval(() => {
-      // Prefer JSON ping; server already handles this pattern
-      this.send({ type: "ping" });
-    }, interval);
-  }
-
-  private stopPing(): void {
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+  /**
+   * Start deduplication cleanup timer
+   */
+  private startDeduplicationCleanup(): void {
+    if (this.config.enableTickDeduplication) {
+      this.deduplicationCleanupTimer = setInterval(() => {
+        if (this.isRunning) {
+          this.cleanupDeduplicationCache();
+        }
+      }, this.config.deduplicationCleanupIntervalMs);
     }
   }
 
-  private async refreshAssetIds(): Promise<void> {
-    const fetched = await this.fetchAssetIds();
-
-    if (fetched.length > 0) {
-      this.assetIds = fetched;
-      logger.info(`${WORKER_NAME} loaded asset ids`, { count: fetched.length });
-      return;
-    }
-
-    const fallback = this.readAssetIdsFromEnv();
-    this.assetIds = fallback;
-    logger.warn(`${WORKER_NAME} fetched zero asset ids; using env fallback`, {
-      fallbackCount: fallback.length
-    });
+  /**
+   * Update processing statistics
+   */
+  private updateProcessingStats(processingTime: number): void {
+    const totalTime = this.stats.averageProcessingTime * this.stats.ticksProcessed + processingTime;
+    this.stats.averageProcessingTime = totalTime / (this.stats.ticksProcessed + 1);
   }
 
-  private readAssetIdsFromEnv(): string[] {
-    return (process.env.POLYMARKET_WS_ASSET_IDS || "")
-      .split(",")
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0);
+  /**
+   * Start health monitoring
+   */
+  private startHealthMonitoring(): void {
+    this.healthCheckTimer = setInterval(async () => {
+      if (this.isRunning) {
+        await this.performHealthCheck();
+      }
+    }, this.config.healthCheckIntervalMs);
   }
 
-  private async fetchAssetIds(): Promise<string[]> {
-    const limit = 100;
-    let offset = 0;
-    const assets = new Set<string>();
-    let pageCount = 0;
+  /**
+   * Perform health check
+   */
+  private async performHealthCheck(): Promise<void> {
+    try {
+      const connectionStats = this.wsHandler.getStats();
+      this.stats.connectionStats = connectionStats;
 
-    while (this.shouldRun) {
-      let markets: PolymarketMarket[] = [];
+      const isHealthy = this.wsHandler.isHealthy();
 
-      try {
-        markets = await polymarketClient.listMarkets({
-          limit,
-          offset,
-          closed: false,
-          order: "createdAt",
-          ascending: false
+      if (!isHealthy) {
+        this.logger.warn('WebSocket connection unhealthy', {
+          connectionStats,
         });
+
+        // Attempt to reconnect if needed
+        if (connectionStats.state === 'disconnected' || connectionStats.state === 'error') {
+          this.logger.info('Attempting to reconnect WebSocket');
+          await this.wsHandler.connect();
+        }
+      }
+
+      this.logger.debug('Health check completed', {
+        connectionStats,
+        isHealthy,
+        deduplicationCacheSize: this.deduplicationCache.size,
+      });
+
+    } catch (error) {
+      this.logger.error('Health check failed', {
+        error: error as Error,
+      });
+      this.stats.errorsCount++;
+    }
+  }
+
+  /**
+   * Get current statistics
+   */
+  getStats(): MarketChannelStats {
+    return {
+      ...this.stats,
+      uptime: Date.now() - this.startTime,
+      connectionStats: this.wsHandler.getStats(),
+    };
+  }
+
+  /**
+   * Check if handler is healthy
+   */
+  isHealthy(): boolean {
+    const wsHealthy = this.wsHandler.isHealthy();
+    const recentlyProcessed = this.stats.lastTickAt
+      ? Date.now() - new Date(this.stats.lastTickAt).getTime() < 60000
+      : false;
+
+    return this.isRunning && wsHealthy && (recentlyProcessed || this.stats.ticksReceived === 0);
+  }
+
+  /**
+   * Get active subscriptions
+   */
+  getActiveSubscriptions(): WsSubscription[] {
+    return this.wsHandler.getSubscriptions();
+  }
+
+  /**
+   * Get WebSocket connection statistics
+   */
+  getConnectionStats(): ConnectionStats {
+    return this.wsHandler.getStats();
+  }
+
+  /**
+   * Setup graceful shutdown handlers
+   */
+  private setupGracefulShutdown(): void {
+    const shutdown = async (signal: string) => {
+      this.logger.info(`Received ${signal}, shutting down market channel handler`);
+      try {
+        await this.stop();
       } catch (error) {
-        logger.error(`${WORKER_NAME} failed to list markets`, {
-          error: formatError(error),
-          offset,
-          limit
+        this.logger.error('Error during shutdown', {
+          error: error as Error,
         });
-        break;
       }
+      process.exit(0);
+    };
 
-      if (!markets.length) {
-        break;
-      }
-
-      const beforeSize = assets.size;
-
-      const filtered = politicsFilter.filterMarkets(markets);
-      for (const market of filtered) {
-        for (const id of this.extractAssetIds(market)) {
-          assets.add(id);
-        }
-      }
-
-      pageCount += 1;
-      offset += limit;
-
-      // Stop if we didn't gain any new asset IDs from this page
-      if (assets.size === beforeSize) {
-        logger.warn(`${WORKER_NAME} pagination yielded no new asset IDs, stopping`, {
-          pageCount,
-          offset
-        });
-        break;
-      }
-
-      // Stop on "natural" last page
-      if (markets.length < limit) {
-        break;
-      }
-
-      // Hard safety guard: prevent unbounded loops
-      if (pageCount >= 1000) {
-        logger.warn(`${WORKER_NAME} reached max pagination pages when fetching markets`, {
-          pageCount,
-          offset
-        });
-        break;
-      }
-    }
-
-    return Array.from(assets);
-  }
-
-  private extractAssetIds(market: PolymarketMarket): string[] {
-    const tokens: unknown = (market as any).clobTokenIds;
-    if (!tokens) return [];
-
-    if (Array.isArray(tokens)) {
-      return tokens.filter(
-        (id): id is string => typeof id === "string" && id.length > 0
-      );
-    }
-
-    if (typeof tokens === "string") {
-      try {
-        const parsed = JSON.parse(tokens);
-        if (Array.isArray(parsed)) {
-          return parsed.filter(
-            (id): id is string => typeof id === "string" && id.length > 0
-          );
-        }
-      } catch {
-        logger.warn(`${WORKER_NAME} failed to parse clobTokenIds`, { marketId: market.id });
-      }
-    }
-
-    return [];
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
   }
 }
 
-export const marketChannelWorker = new MarketChannelWorker();
+/**
+ * Create and initialize market channel WebSocket handler
+ */
+export async function createMarketChannelHandler(
+  ticksQueue: TicksQueue,
+  wsHandler?: PolymarketWebSocketHandler,
+  config?: Partial<MarketChannelConfig>
+): Promise<MarketChannelWebSocketHandler> {
+  const handler = new MarketChannelWebSocketHandler(ticksQueue, wsHandler, config);
+
+  // Send ready signal if running under PM2
+  if (process.send) {
+    process.send('ready');
+  }
+
+  return handler;
+}
+
+/**
+ * Standalone worker entry point
+ */
+export async function runMarketChannelHandler(): Promise<void> {
+  try {
+    const logger = LoggerFactory.getLogger('market-channel-main', {
+      category: LogCategory.WEBSOCKET,
+    });
+
+    logger.info('Initializing market channel WebSocket handler standalone');
+
+    // Initialize dependencies
+    const ticksQueue = new TicksQueue();
+    const wsHandler = new PolymarketWebSocketHandler();
+
+    // Create and start handler
+    const handler = await createMarketChannelHandler(ticksQueue, wsHandler);
+    await handler.start();
+
+    logger.info('Market channel WebSocket handler running standalone');
+
+    // Keep process alive
+    process.on('uncaughtException', (error) => {
+      logger.error('Uncaught exception', { error });
+      process.exit(1);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      logger.error('Unhandled rejection', { reason, promise });
+      process.exit(1);
+    });
+
+  } catch (error) {
+    console.error('Failed to start market channel handler:', error);
+    process.exit(1);
+  }
+}
+
+// Run standalone if this file is executed directly
+if (require.main === module) {
+  runMarketChannelHandler().catch((error) => {
+    console.error('Market channel handler failed:', error);
+    process.exit(1);
+  });
+}
+
+export default MarketChannelWebSocketHandler;
