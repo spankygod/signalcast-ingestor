@@ -9,7 +9,7 @@ interface QueueBarrier {
 }
 
 export class BootstrapCoordinator {
-  private static readonly CHECKPOINT_TTL = 300; // 5 minutes
+  private static readonly CHECKPOINT_TTL = 290; // 5 minutes
   private static readonly LOCK_TTL = 60; // 1 minute
 
   private static stageKey(stage: "events" | "markets" | "outcomes"): string {

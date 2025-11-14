@@ -1,9 +1,16 @@
+// Console log before any imports to catch early failures
+console.log("[AUTOSCALER-DEBUG] Starting dotenv loading...");
+
 import dotenv from "dotenv";
 dotenv.config();
+
+console.log("[AUTOSCALER-DEBUG] Dotenv loaded, starting imports...");
 
 import logger, { formatError } from "../lib/logger";
 import { autoscalerV2 } from "./autoscaler-v2";
 import { heartbeatMonitor } from "./heartbeat";
+
+console.log("[AUTOSCALER-DEBUG] All imports successful, starting logger...");
 
 logger.info("autoscaler-v2 standalone starting", {
   nodeEnv: process.env.NODE_ENV,
