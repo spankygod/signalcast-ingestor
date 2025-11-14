@@ -1,10 +1,11 @@
-import pm2 from "pm2";
 import logger, { formatError } from "../lib/logger";
 import { redis } from "../lib/redis";
 import { BootstrapCoordinator } from "../lib/bootstrap-coordinator";
 import { QUEUES } from "../utils/constants";
 import { heartbeatMonitor } from "./heartbeat";
 import { settings } from "../config/settings";
+import { PM2Manager } from "../lib/pm2-manager";
+import pm2 from "pm2";
 
 const MAX_WORKERS = 5;
 const MIN_WORKERS = 1;
@@ -356,42 +357,29 @@ export class AutoscalerV2 {
   }
 
   private async getCurrentDbWriterWorkers(): Promise<number> {
-    console.log("[AUTOSCALER-DEBUG] Getting current db-writer workers via PM2...");
-    return new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        console.log("[AUTOSCALER-DEBUG] PM2 operation timed out, defaulting to 1 worker");
-        reject(new Error("PM2 operation timeout"));
-      }, 5000); // 5 second timeout
+    console.log("[AUTOSCALER-DEBUG] Getting current db-writer workers via PM2 Manager...");
+    const pm2Manager = PM2Manager.getInstance();
 
-      pm2.connect((err) => {
-        if (err) {
-          clearTimeout(timeout);
-          console.log("[AUTOSCALER-DEBUG] PM2 connect failed:", err);
-          reject(err);
-          return;
-        }
+    try {
+      const processes = await pm2Manager.listProcesses();
+      console.log("[AUTOSCALER-DEBUG] PM2 Manager returned", processes.length, "processes");
 
-        console.log("[AUTOSCALER-DEBUG] PM2 connected, getting process list...");
-        pm2.list((listErr, list) => {
-          clearTimeout(timeout);
-          pm2.disconnect();
+      const dbWriterCount = processes.filter(p =>
+        p.name && p.name.startsWith("db-writer-")
+      ).length;
 
-          if (listErr) {
-            console.log("[AUTOSCALER-DEBUG] PM2 list failed:", listErr);
-            reject(listErr);
-            return;
-          }
-
-          console.log("[AUTOSCALER-DEBUG] PM2 list returned", list.length, "processes");
-          const dbWriterCount = list.filter(p =>
-            p.name && p.name.startsWith("db-writer-")
-          ).length;
-
-          console.log("[AUTOSCALER-DEBUG] Found", dbWriterCount, "db-writer workers");
-          resolve(dbWriterCount);
-        });
+      console.log("[AUTOSCALER-DEBUG] Found", dbWriterCount, "db-writer workers");
+      return dbWriterCount;
+    } catch (error) {
+      console.log("[AUTOSCALER-DEBUG] PM2 Manager failed, falling back to default:", error);
+      // Fallback to 1 worker if PM2 is unavailable
+      return 1;
+    } finally {
+      // Ensure disconnection after operation
+      await pm2Manager.disconnect().catch(() => {
+        // Ignore disconnection errors
       });
-    });
+    }
   }
 
   private async scaleUp(current: number, target: number, reason: string): Promise<void> {
@@ -399,35 +387,30 @@ export class AutoscalerV2 {
       reason
     });
 
+    const pm2Manager = PM2Manager.getInstance();
     const promises: Promise<void>[] = [];
 
     for (let i = current + 1; i <= target; i++) {
-      const promise = new Promise<void>((resolve, reject) => {
-        const workerName = `db-writer-${i}`;
-
-        pm2.start({
-          script: "dist/workers/db-writer-standalone-v2.js",
-          name: workerName,
-          instances: 1,
-          autorestart: true,
-          max_restarts: 5,
-          restart_delay: 2000,
-          min_uptime: 10_000,
-          env: {
-            WORKER_ID: i.toString(),
-            IS_SCALABLE: "true"
-          }
-        }, (err, proc) => {
-          if (err) {
-            logger.error(`[autoscaler-v2] failed to start ${workerName}`, {
-              error: formatError(err)
-            });
-            reject(err);
-          } else {
-            logger.info(`[autoscaler-v2] started ${workerName}`);
-            resolve();
-          }
+      const workerName = `db-writer-${i}`;
+      const promise = pm2Manager.startProcess({
+        script: "dist/workers/db-writer-standalone-v2.js",
+        name: workerName,
+        instances: 1,
+        autorestart: true,
+        max_restarts: 5,
+        restart_delay: 2000,
+        min_uptime: 10_000,
+        env: {
+          WORKER_ID: i.toString(),
+          IS_SCALABLE: "true"
+        }
+      }).then(() => {
+        logger.info(`[autoscaler-v2] started ${workerName}`);
+      }).catch((err) => {
+        logger.error(`[autoscaler-v2] failed to start ${workerName}`, {
+          error: formatError(err)
         });
+        throw err;
       });
 
       promises.push(promise);
