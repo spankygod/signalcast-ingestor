@@ -2,7 +2,7 @@ import { eq, sql, inArray } from "drizzle-orm";
 import logger, { formatError } from "../lib/logger";
 import { polymarketClient } from "../config/polymarket";
 import { pullNextUpdate, pushUpdate, UpdateJob, UpdateKind } from "../queues/updates.queue";
-import { dbInstance, events, markets, outcomes, marketPricesRealtime } from "../lib/db";
+import { db, events, markets, outcomes, marketPricesRealtime } from "../lib/db";
 import {
   NormalizedEvent,
   NormalizedMarket,
@@ -100,47 +100,47 @@ export class DbWriterWorker {
     const uniqueEvents = Array.from(deduped.values());
     const now = new Date();
     const values = uniqueEvents.map(e => ({
-      polymarket_id: e.polymarket_id,
+      polymarketId: e.polymarket_id,
       slug: e.slug,
       title: e.title,
       description: e.description,
       category: e.category,
       subcategory: null,
       liquidity: e.liquidity?.toString() ?? "0",
-      volume_24h: e.volume?.toString() ?? "0",
-      volume_total: e.volume?.toString() ?? "0",
+      volume24h: e.volume?.toString() ?? "0",
+      volumeTotal: e.volume?.toString() ?? "0",
       active: e.is_active,
       closed: e.closed,
       archived: e.archived,
       restricted: e.restricted,
-      relevance_score: "0",
-      start_date: e.start_date ? new Date(e.start_date) : null,
-      end_date: e.end_date ? new Date(e.end_date) : null,
-      last_ingested_at: now,
-      updated_at: now
+      relevanceScore: "0",
+      startDate: e.start_date ? new Date(e.start_date) : null,
+      endDate: e.end_date ? new Date(e.end_date) : null,
+      lastIngestedAt: now,
+      updatedAt: now
     }));
 
-    await dbInstance
+    await db
       .insert(events)
       .values(values)
       .onConflictDoUpdate({
-        target: events.polymarket_id,
+        target: events.polymarketId,
         set: {
           title: sql`excluded.title`,
           slug: sql`excluded.slug`,
           description: sql`excluded.description`,
           category: sql`excluded.category`,
           liquidity: sql`excluded.liquidity`,
-          volume_24h: sql`excluded.volume_24h`,
-          volume_total: sql`excluded.volume_total`,
+          volume24h: sql`excluded.volume_24h`,
+          volumeTotal: sql`excluded.volume_total`,
           active: sql`excluded.active`,
           closed: sql`excluded.closed`,
           archived: sql`excluded.archived`,
           restricted: sql`excluded.restricted`,
-          start_date: sql`excluded.start_date`,
-          end_date: sql`excluded.end_date`,
-          last_ingested_at: sql`excluded.last_ingested_at`,
-          updated_at: sql`excluded.updated_at`
+          startDate: sql`excluded.start_date`,
+          endDate: sql`excluded.end_date`,
+          lastIngestedAt: sql`excluded.last_ingested_at`,
+          updatedAt: sql`excluded.updated_at`
         }
       });
 
@@ -158,12 +158,12 @@ export class DbWriterWorker {
 
     // Resolve parents in bulk
     const eventIds = Array.from(new Set(payloads.map(m => m.event_polymarket_id)));
-    const eventRows = await dbInstance
-      .select({ id: events.id, polymarket_id: events.polymarket_id })
+    const eventRows = await db
+      .select({ id: events.id, polymarketId: events.polymarketId })
       .from(events)
-      .where(inArray(events.polymarket_id, eventIds));
+      .where(inArray(events.polymarketId, eventIds));
 
-    const eventMap = new Map(eventRows.map(r => [r.polymarket_id, r.id]));
+    const eventMap = new Map(eventRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
 
     const ready: { m: NormalizedMarket; eventId: string }[] = [];
     const deferred: UpdateJob<NormalizedMarket>[] = [];
@@ -178,57 +178,57 @@ export class DbWriterWorker {
     if (ready.length > 0) {
       const now = new Date();
       const values = ready.map(({ m, eventId }) => ({
-        polymarket_id: m.polymarket_id,
-        event_id: eventId,
+        polymarketId: m.polymarket_id,
+        eventId: eventId,
         question: m.question,
         slug: m.slug,
         description: m.description,
         liquidity: m.liquidity?.toString() ?? "0",
-        volume_24h: m.volume?.toString() ?? "0",
-        volume_total: m.volume?.toString() ?? "0",
-        current_price: m.current_price?.toString() ?? null,
-        last_trade_price: m.last_trade_price?.toString() ?? null,
-        best_bid: m.best_bid?.toString() ?? null,
-        best_ask: m.best_ask?.toString() ?? null,
+        volume24h: m.volume?.toString() ?? "0",
+        volumeTotal: m.volume?.toString() ?? "0",
+        currentPrice: m.current_price?.toString() ?? null,
+        lastTradePrice: m.last_trade_price?.toString() ?? null,
+        bestBid: m.best_bid?.toString() ?? null,
+        bestAsk: m.best_ask?.toString() ?? null,
         status: m.status,
-        resolved_at: m.resolved_at ? new Date(m.resolved_at) : null,
+        resolvedAt: m.resolved_at ? new Date(m.resolved_at) : null,
         active: m.is_active,
         closed: m.closed,
         archived: m.archived,
         restricted: m.restricted,
         approved: m.approved,
-        relevance_score: m.relevance_score?.toString() ?? "0",
-        last_ingested_at: now,
-        updated_at: now
+        relevanceScore: m.relevance_score?.toString() ?? "0",
+        lastIngestedAt: now,
+        updatedAt: now
       }));
 
-      await dbInstance
+      await db
         .insert(markets)
         .values(values)
         .onConflictDoUpdate({
-          target: markets.polymarket_id,
+          target: markets.polymarketId,
           set: {
-            event_id: sql`excluded.event_id`,
+            eventId: sql`excluded.event_id`,
             question: sql`excluded.question`,
             slug: sql`excluded.slug`,
             description: sql`excluded.description`,
             liquidity: sql`excluded.liquidity`,
-            volume_24h: sql`excluded.volume_24h`,
-            volume_total: sql`excluded.volume_total`,
-            current_price: sql`excluded.current_price`,
-            last_trade_price: sql`excluded.last_trade_price`,
-            best_bid: sql`excluded.best_bid`,
-            best_ask: sql`excluded.best_ask`,
+            volume24h: sql`excluded.volume_24h`,
+            volumeTotal: sql`excluded.volume_total`,
+            currentPrice: sql`excluded.current_price`,
+            lastTradePrice: sql`excluded.last_trade_price`,
+            bestBid: sql`excluded.best_bid`,
+            bestAsk: sql`excluded.best_ask`,
             status: sql`excluded.status`,
-            resolved_at: sql`excluded.resolved_at`,
+            resolvedAt: sql`excluded.resolved_at`,
             active: sql`excluded.active`,
             closed: sql`excluded.closed`,
             archived: sql`excluded.archived`,
             restricted: sql`excluded.restricted`,
             approved: sql`excluded.approved`,
-            relevance_score: sql`excluded.relevance_score`,
-            last_ingested_at: sql`excluded.last_ingested_at`,
-            updated_at: sql`excluded.updated_at`
+            relevanceScore: sql`excluded.relevance_score`,
+            lastIngestedAt: sql`excluded.last_ingested_at`,
+            updatedAt: sql`excluded.updated_at`
           }
         });
     }
@@ -251,12 +251,12 @@ export class DbWriterWorker {
 
     const marketIds = Array.from(new Set(payloads.map(o => o.market_polymarket_id)));
 
-    const marketRows = await dbInstance
-      .select({ id: markets.id, polymarket_id: markets.polymarket_id })
+    const marketRows = await db
+      .select({ id: markets.id, polymarketId: markets.polymarketId })
       .from(markets)
-      .where(inArray(markets.polymarket_id, marketIds));
+      .where(inArray(markets.polymarketId, marketIds));
 
-    const marketMap = new Map(marketRows.map(r => [r.polymarket_id, r.id]));
+    const marketMap = new Map(marketRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
 
     const ready: { o: NormalizedOutcome; marketId: string }[] = [];
     const deferred: UpdateJob<NormalizedOutcome>[] = [];
@@ -271,23 +271,23 @@ export class DbWriterWorker {
     if (ready.length > 0) {
       const now = new Date();
       const values = ready.map(({ o, marketId }) => ({
-        polymarket_id: o.polymarket_id,
-        market_id: marketId,
+        polymarketId: o.polymarket_id,
+        marketId: marketId,
         title: o.title,
         description: o.description,
         price: o.price?.toString() ?? "0",
         probability: o.probability?.toString() ?? "0",
         volume: o.volume?.toString() ?? "0",
         status: o.status,
-        display_order: o.display_order,
-        updated_at: now
+        displayOrder: o.display_order,
+        updatedAt: now
       }));
 
-      await dbInstance
+      await db
         .insert(outcomes)
         .values(values)
         .onConflictDoUpdate({
-          target: outcomes.polymarket_id,
+          target: outcomes.polymarketId,
           set: {
             title: sql`excluded.title`,
             description: sql`excluded.description`,
@@ -295,8 +295,8 @@ export class DbWriterWorker {
             probability: sql`excluded.probability`,
             volume: sql`excluded.volume`,
             status: sql`excluded.status`,
-            display_order: sql`excluded.display_order`,
-            updated_at: sql`excluded.updated_at`
+            displayOrder: sql`excluded.display_order`,
+            updatedAt: sql`excluded.updated_at`
           }
         });
     }
@@ -318,32 +318,32 @@ export class DbWriterWorker {
     const payloads = jobs.map(j => j.payload);
     const marketIds = Array.from(new Set(payloads.map(t => t.market_polymarket_id)));
 
-    const marketRows = await dbInstance
-      .select({ id: markets.id, polymarket_id: markets.polymarket_id })
+    const marketRows = await db
+      .select({ id: markets.id, polymarketId: markets.polymarketId })
       .from(markets)
-      .where(inArray(markets.polymarket_id, marketIds));
+      .where(inArray(markets.polymarketId, marketIds));
 
-    const map = new Map(marketRows.map(r => [r.polymarket_id, r.id]));
+    const map = new Map(marketRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
 
     const batch = payloads
       .map(t => {
         const mId = map.get(t.market_polymarket_id);
         if (!mId) return null;
         return {
-          market_id: mId,
+          marketId: mId,
           price: t.price?.toString() ?? null,
-          best_bid: t.best_bid?.toString() ?? null,
-          best_ask: t.best_ask?.toString() ?? null,
-          last_trade_price: t.last_trade_price?.toString() ?? null,
+          bestBid: t.best_bid?.toString() ?? null,
+          bestAsk: t.best_ask?.toString() ?? null,
+          lastTradePrice: t.last_trade_price?.toString() ?? null,
           liquidity: t.liquidity?.toString() ?? null,
-          volume_24h: t.volume_24h?.toString() ?? null,
-          updated_at: t.captured_at ? new Date(t.captured_at) : new Date()
+          volume24h: t.volume_24h?.toString() ?? null,
+          updatedAt: t.captured_at ? new Date(t.captured_at) : new Date()
         };
       })
       .filter(Boolean) as any[];
 
     if (batch.length > 0) {
-      await dbInstance.insert(marketPricesRealtime).values(batch);
+      await db.insert(marketPricesRealtime).values(batch);
     }
 
     return batch.length;
