@@ -135,8 +135,12 @@ export class AutoscalerV2 {
           // Restart as primary
           if (this.timer) clearInterval(this.timer);
           this.timer = setInterval(() => void this.checkAndScale(), POLL_INTERVAL_MS);
-          console.log("[AUTOSCALER-DEBUG] New primary timer started, calling checkAndScale");
-          void this.checkAndScale();
+          console.log("[AUTOSCALER-DEBUG] New primary timer started, waiting 1s before first check");
+          // Small delay to ensure everything is ready
+          setTimeout(() => {
+            console.log("[AUTOSCALER-DEBUG] Delay completed, calling checkAndScale");
+            void this.checkAndScale();
+          }, 1000);
         } else {
           console.log("[AUTOSCALER-DEBUG] Failed to promote to primary");
         }
@@ -152,24 +156,34 @@ export class AutoscalerV2 {
   }
 
   private async checkAndScale(): Promise<void> {
-    if (this.scalingInProgress) return;
+    console.log("[AUTOSCALER-DEBUG] checkAndScale called...");
+    if (this.scalingInProgress) {
+      console.log("[AUTOSCALER-DEBUG] Scaling already in progress, skipping");
+      return;
+    }
 
     try {
+      console.log("[AUTOSCALER-DEBUG] Refreshing coordination lock...");
       // Refresh coordination lock
       await this.refreshCoordinationLock();
 
+      console.log("[AUTOSCALER-DEBUG] Getting bootstrap status...");
       // Check if bootstrap is complete
       const bootstrapStatus = await BootstrapCoordinator.getBootstrapStatus();
+      console.log("[AUTOSCALER-DEBUG] Bootstrap status:", bootstrapStatus);
 
       if (bootstrapStatus.complete) {
+        console.log("[AUTOSCALER-DEBUG] Bootstrap complete, handling post-bootstrap scaling");
         await this.handlePostBootstrapScaling();
         return;
       }
 
+      console.log("[AUTOSCALER-DEBUG] Bootstrap incomplete, scaling based on events queue");
       // Bootstrap mode: focus on events queue drainage
       await this.scaleBasedOnEventsQueue(bootstrapStatus);
 
     } catch (error) {
+      console.log("[AUTOSCALER-DEBUG] Exception in checkAndScale:", error);
       logger.error("[autoscaler-v2] scaling check failed", {
         error: formatError(error)
       });
