@@ -89,3 +89,6 @@ CREATE TABLE IF NOT EXISTS public.market_prices_realtime (
 );
 
 CREATE INDEX IF NOT EXISTS idx_ticks_market_id ON public.market_prices_realtime (market_id);
+CREATE INDEX IF NOT EXISTS idx_events_start_date ON events (start_date DESC);
+CREATE INDEX IF NOT EXISTS idx_events_id ON events (id);
+CREATE INDEX IF NOT EXISTS idx_events_category ON events (category);
