@@ -155,20 +155,36 @@ const redisFallback = {
     }
   },
 
+  async set(key: string, value: string): Promise<string | null> {
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.set(key, value);
+    }
+    scheduleReconnect();
+    return null;
+  },
+
+  async setWithEX(key: string, value: string, seconds: number): Promise<string | null> {
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.set(key, value, 'EX', seconds);
+    }
+    scheduleReconnect();
+    return null;
+  },
+
+  async expire(key: string, seconds: number): Promise<void> {
+    if (redisAvailable && redisInstance) {
+      await redisInstance.expire(key, seconds);
+    } else {
+      scheduleReconnect();
+    }
+  },
+
   async get(key: string): Promise<string | null> {
     if (redisAvailable && redisInstance) {
       return await redisInstance.get(key);
     }
     scheduleReconnect();
     return null;
-  },
-
-  async set(key: string, value: string): Promise<void> {
-    if (redisAvailable && redisInstance) {
-      await redisInstance.set(key, value);
-    } else {
-      scheduleReconnect();
-    }
   },
 
   async del(key: string): Promise<void> {

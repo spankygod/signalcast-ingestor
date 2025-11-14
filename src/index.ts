@@ -2,14 +2,14 @@ import dotenv from "dotenv";
 dotenv.config();
 
 import logger, { formatError } from "./lib/logger";
-import { eventsPoller } from "./workers/events-poller";
+import { eventsPollerV2 } from "./workers/events-poller-v2";
 import { marketsPoller } from "./workers/markets-poller";
 import { outcomesPoller } from "./workers/outcomes-poller";
 import { marketChannelWorker } from "./workers/wss-market-channel";
 import { heartbeatMonitor } from "./workers/heartbeat";
 
 const workers = [
-  { name: 'events-poller', start: () => eventsPoller.start(), stop: () => eventsPoller.stop() },
+  { name: 'events-poller-v2', start: () => eventsPollerV2.start(), stop: () => eventsPollerV2.stop() },
   { name: 'markets-poller', start: () => marketsPoller.start(), stop: () => marketsPoller.stop() },
   { name: 'outcomes-poller', start: () => outcomesPoller.start(), stop: () => outcomesPoller.stop() },
   { name: 'wss-market-channel', start: () => marketChannelWorker.start(), stop: () => marketChannelWorker.stop() },
