@@ -256,36 +256,64 @@ export class DbWriterWorker {
     });
 
     const startTime = Date.now();
-    await db
-      .insert(events)
-      .values(values)
-      .onConflictDoUpdate({
-        target: events.polymarketId,
-        set: {
-          title: sql`excluded.title`,
-          slug: sql`excluded.slug`,
-          description: sql`excluded.description`,
-          category: sql`excluded.category`,
-          liquidity: sql`excluded.liquidity`,
-          volume24h: sql`excluded.volume_24h`,
-          volumeTotal: sql`excluded.volume_total`,
-          active: sql`excluded.active`,
-          closed: sql`excluded.closed`,
-          archived: sql`excluded.archived`,
-          restricted: sql`excluded.restricted`,
-          startDate: sql`excluded.start_date`,
-          endDate: sql`excluded.end_date`,
-          lastIngestedAt: sql`excluded.last_ingested_at`,
-          updatedAt: sql`excluded.updated_at`
-        }
+
+    try {
+      await db
+        .insert(events)
+        .values(values)
+        .onConflictDoUpdate({
+          target: events.polymarketId,
+          set: {
+            title: sql`excluded.title`,
+            slug: sql`excluded.slug`,
+            description: sql`excluded.description`,
+            category: sql`excluded.category`,
+            liquidity: sql`excluded.liquidity`,
+            volume24h: sql`excluded.volume_24h`,
+            volumeTotal: sql`excluded.volume_total`,
+            active: sql`excluded.active`,
+            closed: sql`excluded.closed`,
+            archived: sql`excluded.archived`,
+            restricted: sql`excluded.restricted`,
+            startDate: sql`excluded.start_date`,
+            endDate: sql`excluded.end_date`,
+            lastIngestedAt: sql`excluded.last_ingested_at`,
+            updatedAt: sql`excluded.updated_at`
+          }
+        });
+
+      const duration = Date.now() - startTime;
+      logger.debug('db-writer completed events database upsert', {
+        recordCount: values.length,
+        duration: `${duration}ms`,
+        avgTimePerRecord: `${Math.round(duration / Math.max(values.length, 1))}ms`
       });
 
-    const duration = Date.now() - startTime;
-    logger.debug('db-writer completed events database upsert', {
-      recordCount: values.length,
-      duration: `${duration}ms`,
-      avgTimePerRecord: `${Math.round(duration / Math.max(values.length, 1))}ms`
-    });
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      logger.error('db-writer events database upsert failed', {
+        recordCount: values.length,
+        duration: `${duration}ms`,
+        error: formatError(error),
+        polymarketIds: values.map(v => v.polymarketId)
+      });
+
+      // Check if this is a constraint violation
+      if (this.isConstraintViolationError(error)) {
+        logger.warn('db-writer detected constraint violation in events batch', {
+          recordCount: values.length,
+          error: (error as Error).message,
+          polymarketIds: values.map(v => v.polymarketId),
+          action: 'processing individually'
+        });
+
+        // Fallback: process events individually to handle duplicates
+        await this.upsertEventsIndividually(batch);
+        return;
+      }
+
+      throw error; // Re-throw non-constraint errors
+    }
   }
 
   // ---------------------------
@@ -746,6 +774,48 @@ export class DbWriterWorker {
     }
 
     return Array.from(map.values());
+  }
+
+  // ---------------------------
+  // ERROR HANDLING HELPERS
+  // ---------------------------
+
+  private isConstraintViolationError(error: any): boolean {
+    // PostgreSQL constraint violation codes:
+    // 23505 - unique_violation
+    // 21000 - "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    return (
+      error?.code === '23505' ||
+      error?.code === '21000' ||
+      error?.message?.includes('ON CONFLICT DO UPDATE command cannot affect row a second time') ||
+      error?.message?.includes('duplicate key') ||
+      error?.message?.includes('unique constraint')
+    );
+  }
+
+  private async upsertEventsIndividually(events: NormalizedEvent[]): Promise<void> {
+    logger.debug('db-writer processing events individually due to constraint violation', {
+      eventCount: events.length
+    });
+
+    for (const event of events) {
+      try {
+        await this.upsertEvents([event]);
+      } catch (error) {
+        if (this.isConstraintViolationError(error)) {
+          logger.debug('db-writer skipping duplicate event', {
+            polymarketId: event.polymarket_id
+          });
+          continue; // Skip duplicates
+        }
+        logger.error('db-writer failed to process individual event', {
+          polymarketId: event.polymarket_id,
+          error: formatError(error)
+        });
+      }
+    }
+
+    logger.debug('db-writer completed individual event processing');
   }
 }
 
