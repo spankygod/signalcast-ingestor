@@ -552,6 +552,11 @@ class EnhancedRedisClient {
    * Perform health check
    */
   async healthCheck(): Promise<boolean> {
+    if (!this.client.isOpen) {
+      this.isHealthy = false;
+      return false;
+    }
+
     try {
       const startTime = Date.now();
       const response = await this.client.ping();
@@ -630,13 +635,8 @@ class EnhancedRedisClient {
    * Close Redis connection
    */
   async close(): Promise<void> {
-    if (this.healthCheckInterval) {
-      clearInterval(this.healthCheckInterval);
-    }
-
-    if (this.metricsInterval) {
-      clearInterval(this.metricsInterval);
-    }
+    this.stopHealthChecking();
+    this.stopMetricsCollection();
 
     await closeRedisConnection();
   }
@@ -667,6 +667,8 @@ class EnhancedRedisClient {
     this.client.on('end', () => {
       console.log('Redis client connection ended');
       this.isHealthy = false;
+      this.stopHealthChecking();
+      this.stopMetricsCollection();
     });
   }
 
@@ -674,6 +676,8 @@ class EnhancedRedisClient {
    * Start periodic health checking
    */
   private startHealthChecking(): void {
+    this.stopHealthChecking();
+
     this.healthCheck().catch(() => {
       // Ignore initial health check failure
     });
@@ -689,6 +693,8 @@ class EnhancedRedisClient {
    * Start metrics collection
    */
   private startMetricsCollection(): void {
+    this.stopMetricsCollection();
+
     this.metricsInterval = setInterval(() => {
       this.getMetrics().catch(() => {
         // Metrics collection failures are logged in the method
@@ -702,6 +708,26 @@ class EnhancedRedisClient {
   private calculateHitRate(hits: number, misses: number): number {
     const total = hits + misses;
     return total > 0 ? (hits / total) * 100 : 0;
+  }
+
+  /**
+   * Stop the periodic health check interval
+   */
+  private stopHealthChecking(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+  }
+
+  /**
+   * Stop the metrics collection interval
+   */
+  private stopMetricsCollection(): void {
+    if (this.metricsInterval) {
+      clearInterval(this.metricsInterval);
+      this.metricsInterval = null;
+    }
   }
 
   /**

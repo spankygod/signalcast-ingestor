@@ -5,16 +5,76 @@
  */
 
 // Core Workers
-export { EventsPollerWorker, createEventsPoller, runEventsPoller } from './events-poller';
-export { MarketsPollerWorker, createMarketsPoller, runMarketsPoller } from './markets-poller';
-export { DatabaseWriterWorker, createDatabaseWriter, runDatabaseWriter } from './db-writer';
-export { AutoscalerWorker, createAutoscaler, runAutoscaler } from './autoscaler';
-export { HeartbeatWorker, createHeartbeat, runHeartbeat } from './heartbeat';
+import {
+  EventsPollerWorker,
+  createEventsPoller,
+  runEventsPoller,
+} from './events-poller';
+import {
+  MarketsPollerWorker,
+  createMarketsPoller,
+  runMarketsPoller,
+} from './markets-poller';
+import {
+  DatabaseWriterWorker,
+  createDatabaseWriter,
+  runDatabaseWriter,
+} from './db-writer';
+import {
+  AutoscalerWorker,
+  createAutoscaler,
+  runAutoscaler,
+} from './autoscaler';
+import {
+  HeartbeatWorker,
+  createHeartbeat,
+  runHeartbeat,
+} from './heartbeat';
 
 // WebSocket Workers
-export { MarketChannelWebSocketHandler, createMarketChannelHandler, runMarketChannelHandler } from './wss-market-channel';
-export { UserChannelWebSocketHandler, createUserChannelHandler, runUserChannelHandler } from './wss-user-channel';
-export { WebSocketUserController, createWebSocketUserController, runWebSocketUserController } from './wss-user-controller';
+import {
+  MarketChannelWebSocketHandler,
+  createMarketChannelHandler,
+  runMarketChannelHandler,
+} from './wss-market-channel';
+import {
+  UserChannelWebSocketHandler,
+  createUserChannelHandler,
+  runUserChannelHandler,
+} from './wss-user-channel';
+import {
+  WebSocketUserController,
+  createWebSocketUserController,
+  runWebSocketUserController,
+} from './wss-user-controller';
+
+// Re-export worker APIs
+export {
+  EventsPollerWorker,
+  createEventsPoller,
+  runEventsPoller,
+  MarketsPollerWorker,
+  createMarketsPoller,
+  runMarketsPoller,
+  DatabaseWriterWorker,
+  createDatabaseWriter,
+  runDatabaseWriter,
+  AutoscalerWorker,
+  createAutoscaler,
+  runAutoscaler,
+  HeartbeatWorker,
+  createHeartbeat,
+  runHeartbeat,
+  MarketChannelWebSocketHandler,
+  createMarketChannelHandler,
+  runMarketChannelHandler,
+  UserChannelWebSocketHandler,
+  createUserChannelHandler,
+  runUserChannelHandler,
+  WebSocketUserController,
+  createWebSocketUserController,
+  runWebSocketUserController,
+};
 
 // Re-export for convenience
 export {
@@ -646,15 +706,6 @@ export const WorkerUtils = {
     return JSON.stringify(stats, null, 2);
   },
 };
-
-// Placeholder class definitions for missing workers
-class EventsPollerWorker { constructor() {} }
-class MarketsPollerWorker { constructor() {} }
-class DatabaseWriterWorker { constructor() {} }
-class AutoscalerWorker { constructor() {} }
-class HeartbeatWorker { constructor() {} }
-class UserChannelWebSocketHandler { constructor() {} }
-class WebSocketUserController { constructor() {} }
 
 export default {
   // Workers
