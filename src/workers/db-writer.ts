@@ -1,8 +1,18 @@
-import { eq, sql, inArray } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import logger, { formatError } from "../lib/logger";
 import { polymarketClient } from "../config/polymarket";
-import { pullNextUpdate, pushUpdate, UpdateJob, UpdateKind } from "../queues/updates.queue";
-import { db, events, markets, outcomes, marketPricesRealtime } from "../lib/db";
+import {
+  pullNextUpdate,
+  UpdateJob,
+  UpdateKind
+} from "../queues/updates.queue";
+import {
+  db,
+  events,
+  markets,
+  outcomes,
+  marketPricesRealtime
+} from "../lib/db";
 import {
   NormalizedEvent,
   NormalizedMarket,
@@ -14,14 +24,19 @@ import { NormalizedTick } from "../utils/normalizeTick";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
 
+const JOB_MAX_ATTEMPTS = Number(process.env.JOB_MAX_ATTEMPTS || 3);
+
 export class DbWriterWorker {
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
 
   start(): void {
     if (this.timer) return;
-    logger.info("db-writer starting [PRO TIER]");
-    this.timer = setInterval(() => void this.drain(), 200);
+    logger.info("db-writer starting [PRO TIER STABLE]");
+    // drain ~5x per second
+    this.timer = setInterval(() => {
+      void this.drain();
+    }, 200);
     void this.drain();
   }
 
@@ -31,27 +46,68 @@ export class DbWriterWorker {
     this.timer = null;
   }
 
-  //---------------------------------------------------------------------
-  // Main Pipeline
-  //---------------------------------------------------------------------
+  // -------------------------------------------------------------------
+  // Main pipeline — STRICT ORDER: events → markets → outcomes → ticks
+  // -------------------------------------------------------------------
 
-  private async drain() {
+  private async drain(): Promise<void> {
     if (this.draining) return;
     this.draining = true;
 
     try {
-      const pipeline = [
-        { kind: "event" as UpdateKind, batchSize: 20, handler: this.processEventBatch.bind(this) },
-        { kind: "market" as UpdateKind, batchSize: 20, handler: this.processMarketBatch.bind(this) },
-        { kind: "outcome" as UpdateKind, batchSize: 50, handler: this.processOutcomeBatch.bind(this) },
-        { kind: "tick" as UpdateKind, batchSize: 100, handler: this.processTickBatch.bind(this) }
-      ];
+      let totalProcessed = 0;
 
-      for (const stage of pipeline) {
-        const processed = await this.processQueue(stage.kind, stage.batchSize, stage.handler);
-        if (processed > 0) {
-          heartbeatMonitor.beat(WORKERS.dbWriter, { stage: stage.kind, processed });
-        }
+      // 1) EVENTS (parents-of-all)
+      const eventsProcessed = await this.processQueue(
+        "event",
+        20,
+        (jobs) => this.processEventBatch(jobs as UpdateJob<NormalizedEvent>[])
+      );
+      totalProcessed += eventsProcessed;
+      heartbeatMonitor.beat(WORKERS.dbWriter, {
+        stage: "event",
+        processed: eventsProcessed
+      });
+
+      // 2) MARKETS (children of events, parents of outcomes/ticks)
+      const marketsProcessed = await this.processQueue(
+        "market",
+        20,
+        (jobs) => this.processMarketBatch(jobs as UpdateJob<NormalizedMarket>[])
+      );
+      totalProcessed += marketsProcessed;
+      heartbeatMonitor.beat(WORKERS.dbWriter, {
+        stage: "market",
+        processed: marketsProcessed
+      });
+
+      // 3) OUTCOMES (children of markets)
+      const outcomesProcessed = await this.processQueue(
+        "outcome",
+        50,
+        (jobs) => this.processOutcomeBatch(jobs as UpdateJob<NormalizedOutcome>[])
+      );
+      totalProcessed += outcomesProcessed;
+      heartbeatMonitor.beat(WORKERS.dbWriter, {
+        stage: "outcome",
+        processed: outcomesProcessed
+      });
+
+      // 4) TICKS (children of markets, insert-only)
+      const ticksProcessed = await this.processQueue(
+        "tick",
+        100,
+        (jobs) => this.processTickBatch(jobs as UpdateJob<NormalizedTick>[])
+      );
+      totalProcessed += ticksProcessed;
+      heartbeatMonitor.beat(WORKERS.dbWriter, {
+        stage: "tick",
+        processed: ticksProcessed
+      });
+
+      if (totalProcessed === 0) {
+        heartbeatMonitor.beat(WORKERS.dbWriter, { state: "idle" });
+        heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
       logger.error("db-writer drain failed", { error: formatError(error) });
@@ -70,13 +126,27 @@ export class DbWriterWorker {
     while (true) {
       const jobs = await this.pullJobs(kind, batchSize);
       if (jobs.length === 0) break;
-      total += await handler(jobs);
+
+      try {
+        const handled = await handler(jobs);
+        total += handled;
+      } catch (error) {
+        logger.error(`db-writer failed processing ${kind} batch`, {
+          error: formatError(error),
+          kind
+        });
+        // break to avoid infinite error loop
+        break;
+      }
     }
 
     return total;
   }
 
-  private async pullJobs(kind: UpdateKind, max: number) {
+  private async pullJobs(
+    kind: UpdateKind,
+    max: number
+  ): Promise<UpdateJob<any>[]> {
     const jobs: UpdateJob<any>[] = [];
     for (let i = 0; i < max; i++) {
       const job = await pullNextUpdate(kind);
@@ -86,29 +156,43 @@ export class DbWriterWorker {
     return jobs;
   }
 
-  //---------------------------------------------------------------------
-  // EVENT BATCH UPSERT
-  //---------------------------------------------------------------------
+  // -------------------------------------------------------------------
+  // EVENTS — bulk upsert, parent of everything
+  // -------------------------------------------------------------------
 
-  private async processEventBatch(jobs: UpdateJob<NormalizedEvent>[]): Promise<number> {
+  private async processEventBatch(
+    jobs: UpdateJob<NormalizedEvent>[]
+  ): Promise<number> {
     if (jobs.length === 0) return 0;
-    const deduped = new Map<string, NormalizedEvent>();
-    for (const payload of jobs.map(j => j.payload)) {
-      deduped.set(payload.polymarket_id, payload);
+
+    // dedupe by polymarket_id
+    const map = new Map<string, NormalizedEvent>();
+    for (const job of jobs) {
+      if (!job.payload?.polymarket_id) continue;
+      map.set(job.payload.polymarket_id, job.payload);
     }
 
-    const uniqueEvents = Array.from(deduped.values());
+    const eventsList = Array.from(map.values());
+    if (eventsList.length === 0) return 0;
+
+    await this.upsertEvents(eventsList);
+    return eventsList.length;
+  }
+
+  private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
+    if (batch.length === 0) return;
     const now = new Date();
-    const values = uniqueEvents.map(e => ({
+
+    const values = batch.map((e) => ({
       polymarketId: e.polymarket_id,
       slug: e.slug,
       title: e.title,
       description: e.description,
       category: e.category,
-      subcategory: null,
-      liquidity: e.liquidity?.toString() ?? "0",
-      volume24h: e.volume?.toString() ?? "0",
-      volumeTotal: e.volume?.toString() ?? "0",
+      subcategory: null as string | null, // not used yet
+      liquidity: e.liquidity != null ? e.liquidity.toString() : "0",
+      volume24h: e.volume != null ? e.volume.toString() : "0",
+      volumeTotal: e.volume != null ? e.volume.toString() : "0",
       active: e.is_active,
       closed: e.closed,
       archived: e.archived,
@@ -131,222 +215,358 @@ export class DbWriterWorker {
           description: sql`excluded.description`,
           category: sql`excluded.category`,
           liquidity: sql`excluded.liquidity`,
-          volume24h: sql`excluded.volume_24h`,
-          volumeTotal: sql`excluded.volume_total`,
+          volume24h: sql`excluded.volume24h`,
+          volumeTotal: sql`excluded.volumeTotal`,
           active: sql`excluded.active`,
           closed: sql`excluded.closed`,
           archived: sql`excluded.archived`,
           restricted: sql`excluded.restricted`,
-          startDate: sql`excluded.start_date`,
-          endDate: sql`excluded.end_date`,
-          lastIngestedAt: sql`excluded.last_ingested_at`,
-          updatedAt: sql`excluded.updated_at`
+          startDate: sql`excluded.startDate`,
+          endDate: sql`excluded.endDate`,
+          lastIngestedAt: sql`excluded.lastIngestedAt`,
+          updatedAt: sql`excluded.updatedAt`
         }
       });
-
-    return uniqueEvents.length;
   }
 
-  //---------------------------------------------------------------------
-  // MARKET BATCH UPSERT
-  //---------------------------------------------------------------------
+  // -------------------------------------------------------------------
+  // MARKETS — ensure event exists, then bulk upsert
+  // -------------------------------------------------------------------
 
-  private async processMarketBatch(jobs: UpdateJob<NormalizedMarket>[]): Promise<number> {
+  private async processMarketBatch(
+    jobs: UpdateJob<NormalizedMarket>[]
+  ): Promise<number> {
     if (jobs.length === 0) return 0;
 
-    const payloads = jobs.map(j => j.payload);
-
-    // Resolve parents in bulk
-    const eventIds = Array.from(new Set(payloads.map(m => m.event_polymarket_id)));
-    const eventRows = await db
-      .select({ id: events.id, polymarketId: events.polymarketId })
-      .from(events)
-      .where(inArray(events.polymarketId, eventIds));
-
-    const eventMap = new Map(eventRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
-
-    const ready: { m: NormalizedMarket; eventId: string }[] = [];
-    const deferred: UpdateJob<NormalizedMarket>[] = [];
+    const batch: { market: NormalizedMarket; eventId: string }[] = [];
 
     for (const job of jobs) {
       const m = job.payload;
-      const eventId = eventMap.get(m.event_polymarket_id);
-      if (!eventId) deferred.push(job);
-      else ready.push({ m, eventId });
-    }
+      if (!m?.polymarket_id || !m.event_polymarket_id) continue;
 
-    if (ready.length > 0) {
-      const now = new Date();
-      const values = ready.map(({ m, eventId }) => ({
-        polymarketId: m.polymarket_id,
-        eventId: eventId,
-        question: m.question,
-        slug: m.slug,
-        description: m.description,
-        liquidity: m.liquidity?.toString() ?? "0",
-        volume24h: m.volume?.toString() ?? "0",
-        volumeTotal: m.volume?.toString() ?? "0",
-        currentPrice: m.current_price?.toString() ?? null,
-        lastTradePrice: m.last_trade_price?.toString() ?? null,
-        bestBid: m.best_bid?.toString() ?? null,
-        bestAsk: m.best_ask?.toString() ?? null,
-        status: m.status,
-        resolvedAt: m.resolved_at ? new Date(m.resolved_at) : null,
-        active: m.is_active,
-        closed: m.closed,
-        archived: m.archived,
-        restricted: m.restricted,
-        approved: m.approved,
-        relevanceScore: m.relevance_score?.toString() ?? "0",
-        lastIngestedAt: now,
-        updatedAt: now
-      }));
-
-      await db
-        .insert(markets)
-        .values(values)
-        .onConflictDoUpdate({
-          target: markets.polymarketId,
-          set: {
-            eventId: sql`excluded.event_id`,
-            question: sql`excluded.question`,
-            slug: sql`excluded.slug`,
-            description: sql`excluded.description`,
-            liquidity: sql`excluded.liquidity`,
-            volume24h: sql`excluded.volume_24h`,
-            volumeTotal: sql`excluded.volume_total`,
-            currentPrice: sql`excluded.current_price`,
-            lastTradePrice: sql`excluded.last_trade_price`,
-            bestBid: sql`excluded.best_bid`,
-            bestAsk: sql`excluded.best_ask`,
-            status: sql`excluded.status`,
-            resolvedAt: sql`excluded.resolved_at`,
-            active: sql`excluded.active`,
-            closed: sql`excluded.closed`,
-            archived: sql`excluded.archived`,
-            restricted: sql`excluded.restricted`,
-            approved: sql`excluded.approved`,
-            relevanceScore: sql`excluded.relevance_score`,
-            lastIngestedAt: sql`excluded.last_ingested_at`,
-            updatedAt: sql`excluded.updated_at`
-          }
+      const eventId = await this.ensureEventExists(m.event_polymarket_id);
+      if (!eventId) {
+        // can't guarantee parent, skip this market
+        logger.warn("db-writer skipping market with missing parent event", {
+          marketPolymarketId: m.polymarket_id,
+          eventPolymarketId: m.event_polymarket_id
         });
+        continue;
+      }
+
+      batch.push({ market: m, eventId });
     }
 
-    // Requeue parents missing
-    for (const job of deferred) {
-      await pushUpdate("market", job.payload, (job.attempts ?? 0) + 1);
-    }
+    if (batch.length === 0) return 0;
 
-    return ready.length;
+    await this.upsertMarkets(batch);
+    return batch.length;
   }
 
-  //---------------------------------------------------------------------
-  // OUTCOME BATCH UPSERT
-  //---------------------------------------------------------------------
+  private async upsertMarkets(
+    batch: { market: NormalizedMarket; eventId: string }[]
+  ): Promise<void> {
+    if (batch.length === 0) return;
+    const now = new Date();
 
-  private async processOutcomeBatch(jobs: UpdateJob<NormalizedOutcome>[]): Promise<number> {
+    const values = batch.map(({ market, eventId }) => ({
+      polymarketId: market.polymarket_id,
+      eventId: eventId,
+      question: market.question,
+      slug: market.slug,
+      description: market.description,
+      liquidity: market.liquidity != null ? market.liquidity.toString() : "0",
+      volume24h: market.volume != null ? market.volume.toString() : "0",
+      volumeTotal: market.volume != null ? market.volume.toString() : "0",
+      currentPrice:
+        market.current_price != null ? market.current_price.toString() : null,
+      lastTradePrice:
+        market.last_trade_price != null
+          ? market.last_trade_price.toString()
+          : null,
+      bestBid: market.best_bid != null ? market.best_bid.toString() : null,
+      bestAsk: market.best_ask != null ? market.best_ask.toString() : null,
+      status: market.status,
+      resolvedAt: market.resolved_at ? new Date(market.resolved_at) : null,
+      active: market.is_active,
+      closed: market.closed,
+      archived: market.archived,
+      restricted: market.restricted,
+      approved: market.approved,
+      relevanceScore:
+        market.relevance_score != null
+          ? market.relevance_score.toString()
+          : "0",
+      lastIngestedAt: now,
+      updatedAt: now
+    }));
+
+    await db
+      .insert(markets)
+      .values(values)
+      .onConflictDoUpdate({
+        target: markets.polymarketId,
+        set: {
+          eventId: sql`excluded.eventId`,
+          question: sql`excluded.question`,
+          slug: sql`excluded.slug`,
+          description: sql`excluded.description`,
+          liquidity: sql`excluded.liquidity`,
+          volume24h: sql`excluded.volume24h`,
+          volumeTotal: sql`excluded.volumeTotal`,
+          currentPrice: sql`excluded.currentPrice`,
+          lastTradePrice: sql`excluded.lastTradePrice`,
+          bestBid: sql`excluded.bestBid`,
+          bestAsk: sql`excluded.bestAsk`,
+          status: sql`excluded.status`,
+          resolvedAt: sql`excluded.resolvedAt`,
+          active: sql`excluded.active`,
+          closed: sql`excluded.closed`,
+          archived: sql`excluded.archived`,
+          restricted: sql`excluded.restricted`,
+          approved: sql`excluded.approved`,
+          relevanceScore: sql`excluded.relevanceScore`,
+          lastIngestedAt: sql`excluded.lastIngestedAt`,
+          updatedAt: sql`excluded.updatedAt`
+        }
+      });
+  }
+
+  // -------------------------------------------------------------------
+  // OUTCOMES — ensure market exists, then bulk upsert
+  // -------------------------------------------------------------------
+
+  private async processOutcomeBatch(
+    jobs: UpdateJob<NormalizedOutcome>[]
+  ): Promise<number> {
     if (jobs.length === 0) return 0;
-    const payloads = jobs.map(j => j.payload);
 
-    const marketIds = Array.from(new Set(payloads.map(o => o.market_polymarket_id)));
-
-    const marketRows = await db
-      .select({ id: markets.id, polymarketId: markets.polymarketId })
-      .from(markets)
-      .where(inArray(markets.polymarketId, marketIds));
-
-    const marketMap = new Map(marketRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
-
-    const ready: { o: NormalizedOutcome; marketId: string }[] = [];
-    const deferred: UpdateJob<NormalizedOutcome>[] = [];
+    const batch: { outcome: NormalizedOutcome; marketId: string }[] = [];
 
     for (const job of jobs) {
       const o = job.payload;
-      const parentId = marketMap.get(o.market_polymarket_id);
-      if (!parentId) deferred.push(job);
-      else ready.push({ o, marketId: parentId });
-    }
+      if (!o?.polymarket_id || !o.market_polymarket_id) continue;
 
-    if (ready.length > 0) {
-      const now = new Date();
-      const values = ready.map(({ o, marketId }) => ({
-        polymarketId: o.polymarket_id,
-        marketId: marketId,
-        title: o.title,
-        description: o.description,
-        price: o.price?.toString() ?? "0",
-        probability: o.probability?.toString() ?? "0",
-        volume: o.volume?.toString() ?? "0",
-        status: o.status,
-        displayOrder: o.display_order,
-        updatedAt: now
-      }));
-
-      await db
-        .insert(outcomes)
-        .values(values)
-        .onConflictDoUpdate({
-          target: outcomes.polymarketId,
-          set: {
-            title: sql`excluded.title`,
-            description: sql`excluded.description`,
-            price: sql`excluded.price`,
-            probability: sql`excluded.probability`,
-            volume: sql`excluded.volume`,
-            status: sql`excluded.status`,
-            displayOrder: sql`excluded.display_order`,
-            updatedAt: sql`excluded.updated_at`
-          }
+      const marketId = await this.ensureMarketExists(o.market_polymarket_id);
+      if (!marketId) {
+        logger.warn("db-writer skipping outcome with missing parent market", {
+          outcomePolymarketId: o.polymarket_id,
+          marketPolymarketId: o.market_polymarket_id
         });
+        continue;
+      }
+
+      batch.push({ outcome: o, marketId });
     }
 
-    for (const job of deferred) {
-      await pushUpdate("outcome", job.payload, (job.attempts ?? 0) + 1);
-    }
+    if (batch.length === 0) return 0;
 
-    return ready.length;
+    await this.upsertOutcomes(batch);
+    return batch.length;
   }
 
-  //---------------------------------------------------------------------
-  // TICKS BATCH INSERT (NO UPSERT)
-  //---------------------------------------------------------------------
+  private async upsertOutcomes(
+    batch: { outcome: NormalizedOutcome; marketId: string }[]
+  ): Promise<void> {
+    if (batch.length === 0) return;
+    const now = new Date();
 
-  private async processTickBatch(jobs: UpdateJob<NormalizedTick>[]): Promise<number> {
+    const values = batch.map(({ outcome, marketId }) => ({
+      polymarketId: outcome.polymarket_id,
+      marketId: marketId,
+      title: outcome.title,
+      description: outcome.description,
+      price: outcome.price != null ? outcome.price.toString() : "0",
+      probability:
+        outcome.probability != null ? outcome.probability.toString() : "0",
+      volume: outcome.volume != null ? outcome.volume.toString() : "0",
+      status: outcome.status,
+      displayOrder: outcome.display_order,
+      updatedAt: now
+    }));
+
+    await db
+      .insert(outcomes)
+      .values(values)
+      .onConflictDoUpdate({
+        target: outcomes.polymarketId,
+        set: {
+          title: sql`excluded.title`,
+          description: sql`excluded.description`,
+          price: sql`excluded.price`,
+          probability: sql`excluded.probability`,
+          volume: sql`excluded.volume`,
+          status: sql`excluded.status`,
+          displayOrder: sql`excluded.displayOrder`,
+          updatedAt: sql`excluded.updatedAt`
+        }
+      });
+  }
+
+  // -------------------------------------------------------------------
+  // TICKS — ensure market exists, then insert-only
+  // -------------------------------------------------------------------
+
+  private async processTickBatch(
+    jobs: UpdateJob<NormalizedTick>[]
+  ): Promise<number> {
     if (jobs.length === 0) return 0;
 
-    const payloads = jobs.map(j => j.payload);
-    const marketIds = Array.from(new Set(payloads.map(t => t.market_polymarket_id)));
+    const rows: {
+      marketId: string;
+      price: string | null;
+      bestBid: string | null;
+      bestAsk: string | null;
+      lastTradePrice: string | null;
+      liquidity: string | null;
+      volume24h: string | null;
+      updatedAt: Date;
+    }[] = [];
 
-    const marketRows = await db
-      .select({ id: markets.id, polymarketId: markets.polymarketId })
-      .from(markets)
-      .where(inArray(markets.polymarketId, marketIds));
+    for (const job of jobs) {
+      const t = job.payload;
+      if (!t?.market_polymarket_id) continue;
 
-    const map = new Map(marketRows.map((r: { id: string; polymarketId: string }) => [r.polymarketId, r.id]));
+      const marketId = await this.ensureMarketExists(t.market_polymarket_id);
+      if (!marketId) {
+        logger.debug("db-writer skipping tick for unknown market", {
+          marketPolymarketId: t.market_polymarket_id
+        });
+        continue;
+      }
 
-    const batch = payloads
-      .map(t => {
-        const mId = map.get(t.market_polymarket_id);
-        if (!mId) return null;
-        return {
-          marketId: mId,
-          price: t.price?.toString() ?? null,
-          bestBid: t.best_bid?.toString() ?? null,
-          bestAsk: t.best_ask?.toString() ?? null,
-          lastTradePrice: t.last_trade_price?.toString() ?? null,
-          liquidity: t.liquidity?.toString() ?? null,
-          volume24h: t.volume_24h?.toString() ?? null,
-          updatedAt: t.captured_at ? new Date(t.captured_at) : new Date()
-        };
-      })
-      .filter(Boolean) as any[];
-
-    if (batch.length > 0) {
-      await db.insert(marketPricesRealtime).values(batch);
+      rows.push({
+        marketId: marketId,
+        price: t.price != null ? t.price.toString() : null,
+        bestBid: t.best_bid != null ? t.best_bid.toString() : null,
+        bestAsk: t.best_ask != null ? t.best_ask.toString() : null,
+        lastTradePrice:
+          t.last_trade_price != null ? t.last_trade_price.toString() : null,
+        liquidity: t.liquidity != null ? t.liquidity.toString() : null,
+        volume24h:
+          t.volume_24h != null ? t.volume_24h.toString() : null,
+        updatedAt: t.captured_at ? new Date(t.captured_at) : new Date()
+      });
     }
 
-    return batch.length;
+    if (rows.length === 0) return 0;
+
+    await db.insert(marketPricesRealtime).values(rows);
+    return rows.length;
+  }
+
+  // -------------------------------------------------------------------
+  // PARENT HELPERS — ensure event/market exist (DB first, API fallback)
+  // -------------------------------------------------------------------
+
+  private async ensureEventExists(
+    eventPolymarketId: string
+  ): Promise<string | null> {
+    if (!eventPolymarketId) return null;
+
+    // 1) Try DB first
+    const existing = await db
+      .select({ id: events.id })
+      .from(events)
+      .where(eq(events.polymarketId, eventPolymarketId))
+      .limit(1);
+
+    if (existing[0]?.id) return existing[0].id;
+
+    // 2) Fallback: fetch from API + normalize + upsert
+    try {
+      const apiEvent = await polymarketClient.getEvent(eventPolymarketId);
+      if (!apiEvent) {
+        logger.warn("db-writer ensureEventExists: API returned no event", {
+          eventPolymarketId
+        });
+        return null;
+      }
+
+      const normalized = normalizeEvent(apiEvent);
+      await this.upsertEvents([normalized]);
+
+      const after = await db
+        .select({ id: events.id })
+        .from(events)
+        .where(eq(events.polymarketId, eventPolymarketId))
+        .limit(1);
+
+      return after[0]?.id ?? null;
+    } catch (error) {
+      logger.warn("db-writer ensureEventExists: failed to fetch event", {
+        eventPolymarketId,
+        error: formatError(error)
+      });
+      return null;
+    }
+  }
+
+  private async ensureMarketExists(
+    marketPolymarketId: string
+  ): Promise<string | null> {
+    if (!marketPolymarketId) return null;
+
+    // 1) Try DB first
+    const existing = await db
+      .select({ id: markets.id })
+      .from(markets)
+      .where(eq(markets.polymarketId, marketPolymarketId))
+      .limit(1);
+
+    if (existing[0]?.id) return existing[0].id;
+
+    // 2) Fallback: fetch from API, ensure event, then upsert market
+    try {
+      const apiMarket = await polymarketClient.getMarket(marketPolymarketId);
+      if (!apiMarket) {
+        logger.warn("db-writer ensureMarketExists: API returned no market", {
+          marketPolymarketId
+        });
+        return null;
+      }
+
+      const eventPolymarketId =
+        apiMarket.event?.id ?? apiMarket.eventId ?? apiMarket.id;
+      let eventId: string | null = null;
+
+      if (eventPolymarketId) {
+        // if API gives embedded event, normalize + upsert directly
+        if (apiMarket.event) {
+          const normalizedEvent = normalizeEvent(apiMarket.event);
+          await this.upsertEvents([normalizedEvent]);
+        }
+        eventId = await this.ensureEventExists(eventPolymarketId);
+      }
+
+      if (!eventId) {
+        logger.warn(
+          "db-writer ensureMarketExists: unable to resolve parent event",
+          { marketPolymarketId, eventPolymarketId }
+        );
+        return null;
+      }
+
+      const normalizedMarket = normalizeMarket(apiMarket, {
+        id: eventPolymarketId
+      }) as NormalizedMarket;
+
+      await this.upsertMarkets([{ market: normalizedMarket, eventId }]);
+
+      const after = await db
+        .select({ id: markets.id })
+        .from(markets)
+        .where(eq(markets.polymarketId, marketPolymarketId))
+        .limit(1);
+
+      return after[0]?.id ?? null;
+    } catch (error) {
+      logger.warn("db-writer ensureMarketExists: failed to fetch market", {
+        marketPolymarketId,
+        error: formatError(error)
+      });
+      return null;
+    }
   }
 }
 

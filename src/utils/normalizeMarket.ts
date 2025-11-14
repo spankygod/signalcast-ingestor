@@ -2,19 +2,19 @@ import { PolymarketEvent, PolymarketMarket, PolymarketOutcome } from '../config/
 
 export interface NormalizedEvent {
   polymarket_id: string;
+  slug: string | null;
   title: string;
-  slug: string;
   description: string | null;
   category: string | null;
-  liquidity: number;
-  volume: number;
+  subcategory: string | null;
+  liquidity: number | null;
+  volume: number | null;  // we reuse for both volume_24h & volume_total
   is_active: boolean;
   closed: boolean;
   archived: boolean;
   restricted: boolean;
-  start_date: Date | null;
-  end_date: Date | null;
-  last_ingested_at: Date;
+  start_date: string | null;
+  end_date: string | null;
 }
 
 export interface NormalizedMarket {
@@ -22,15 +22,15 @@ export interface NormalizedMarket {
   event_polymarket_id: string;
   question: string;
   slug: string;
-  description: string | null;
+  description: string;
   liquidity: number;
   volume: number;
-  current_price: number | null;
-  last_trade_price: number | null;
-  best_bid: number | null;
-  best_ask: number | null;
+  current_price: number;
+  last_trade_price: number;
+  best_bid: number;
+  best_ask: number;
   status: string;
-  resolved_at: Date | null;
+  resolved_at: string | null;
   is_active: boolean;
   closed: boolean;
   archived: boolean;
@@ -43,7 +43,7 @@ export interface NormalizedOutcome {
   polymarket_id: string;
   market_polymarket_id: string;
   title: string;
-  description: string | null;
+  description: string;
   price: number;
   probability: number;
   volume: number;
@@ -54,19 +54,19 @@ export interface NormalizedOutcome {
 export function normalizeEvent(event: PolymarketEvent): NormalizedEvent {
   return {
     polymarket_id: event.id,
+    slug: event.slug || null,
     title: event.title,
-    slug: event.slug,
-    description: event.description,
+    description: event.description || null,
     category: event.category || null,
-    liquidity: event.liquidity || 0,
-    volume: event.volume || 0,
+    subcategory: null, // not used yet
+    liquidity: event.liquidity || null,
+    volume: event.volume || null,
     is_active: event.isActive,
     closed: event.closed,
     archived: event.archived,
     restricted: event.restricted,
-    start_date: event.startDate ? new Date(event.startDate) : null,
-    end_date: event.endDate ? new Date(event.endDate) : null,
-    last_ingested_at: new Date()
+    start_date: event.startDate || null,
+    end_date: event.endDate || null
   };
 }
 
@@ -83,15 +83,15 @@ export function normalizeMarket(
     event_polymarket_id: event.id,
     question: market.question,
     slug: market.slug,
-    description: market.description,
+    description: market.description || '',
     liquidity: market.liquidity || 0,
     volume: market.volume || 0,
-    current_price: market.currentPrice,
-    last_trade_price: market.lastTradePrice,
-    best_bid: market.bestBid,
-    best_ask: market.bestAsk,
+    current_price: market.currentPrice || 0,
+    last_trade_price: market.lastTradePrice || 0,
+    best_bid: market.bestBid || 0,
+    best_ask: market.bestAsk || 0,
     status: mapMarketStatus(market.status, market.closed),
-    resolved_at: market.resolvedAt ? new Date(market.resolvedAt) : null,
+    resolved_at: market.resolvedAt || null,
     is_active: market.isActive,
     closed: market.closed,
     archived: market.archived,
@@ -106,7 +106,7 @@ export function normalizeOutcome(outcome: PolymarketOutcome, market: PolymarketM
     polymarket_id: outcome.id,
     market_polymarket_id: market.id,
     title: outcome.title,
-    description: outcome.description,
+    description: outcome.description || '',
     price: outcome.price,
     probability: outcome.probability,
     volume: outcome.volume,
