@@ -659,7 +659,7 @@ export function getWorkerSystemInfo(): WorkerSystemInfo {
 }
 
 // Export system info
-export { WorkerSystemInfo };
+export type { WorkerSystemInfo };
 
 /**
  * Worker utilities
@@ -727,5 +727,4 @@ export default {
   // Utilities
   WorkerUtils,
   getWorkerSystemInfo,
-  WorkerSystemInfo,
 };
