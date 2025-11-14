@@ -74,7 +74,25 @@ export class DbWriterWorker {
       ];
 
       for (const stage of pipeline) {
-        totalProcessed += await this.processQueue(stage);
+        logger.info(`db-writer starting pipeline stage: ${stage.kind}`, {
+          stage: stage.kind,
+          batchSize: stage.batchSize,
+          totalProcessedSoFar: totalProcessed
+        });
+
+        const stageStart = Date.now();
+        const stageProcessed = await this.processQueue(stage);
+        const stageDuration = Date.now() - stageStart;
+
+        totalProcessed += stageProcessed;
+
+        logger.info(`db-writer completed pipeline stage: ${stage.kind}`, {
+          stage: stage.kind,
+          stageProcessed,
+          stageDuration: `${stageDuration}ms`,
+          totalProcessedSoFar: totalProcessed,
+          avgPerJob: stageProcessed > 0 ? `${Math.round(stageDuration / stageProcessed)}ms/job` : 'N/A'
+        });
       }
 
       if (totalProcessed === 0) {
@@ -91,20 +109,72 @@ export class DbWriterWorker {
 
   private async processQueue(stage: PipelineStage): Promise<number> {
     let processed = 0;
+    let batchCount = 0;
+
+    logger.debug(`db-writer starting ${stage.kind} queue processing`, {
+      batchSize: stage.batchSize,
+      initialProcessed: processed
+    });
 
     while (true) {
-      const jobs = await this.pullJobs(stage.kind, stage.batchSize);
-      if (jobs.length === 0) break;
+      batchCount++;
+      logger.debug(`db-writer pulling ${stage.kind} jobs - batch ${batchCount}`, {
+        batchNumber: batchCount,
+        processedSoFar: processed,
+        batchSize: stage.batchSize
+      });
 
-      const handled = await stage.handler(jobs);
-      if (handled > 0) {
-        processed += handled;
-        heartbeatMonitor.beat(WORKERS.dbWriter, {
-          kind: stage.kind,
-          processed
+      const jobs = await this.pullJobs(stage.kind, stage.batchSize);
+      if (jobs.length === 0) {
+        logger.debug(`db-writer no more ${stage.kind} jobs available`, {
+          batchNumber: batchCount,
+          totalProcessed: processed,
+          totalBatches: batchCount - 1
         });
+        break;
+      }
+
+      logger.debug(`db-writer processing ${stage.kind} batch`, {
+        batchNumber: batchCount,
+        jobCount: jobs.length,
+        processedSoFar: processed,
+        jobIdRange: jobs.length > 0 ? `${jobs[0]?.queuedAt}-${jobs[jobs.length - 1]?.queuedAt}` : 'empty'
+      });
+
+      try {
+        const handled = await stage.handler(jobs);
+        logger.debug(`db-writer completed ${stage.kind} batch`, {
+          batchNumber: batchCount,
+          jobCount: jobs.length,
+          handledCount: handled,
+          processedSoFar: processed,
+          newTotal: processed + handled
+        });
+
+        if (handled > 0) {
+          processed += handled;
+          heartbeatMonitor.beat(WORKERS.dbWriter, {
+            kind: stage.kind,
+            processed
+          });
+        }
+      } catch (error) {
+        logger.error(`db-writer failed to process ${stage.kind} batch`, {
+          batchNumber: batchCount,
+          jobCount: jobs.length,
+          error: formatError(error),
+          processedSoFar: processed,
+          jobs: jobs.map(j => ({ kind: j.kind, attempts: j.attempts, queuedAt: j.queuedAt }))
+        });
+        throw error;
       }
     }
+
+    logger.info(`db-writer completed ${stage.kind} queue processing`, {
+      totalBatches: batchCount - 1,
+      totalProcessed: processed,
+      averageJobsPerBatch: batchCount > 1 ? processed / (batchCount - 1) : 0
+    });
 
     return processed;
   }
@@ -125,12 +195,39 @@ export class DbWriterWorker {
 
   private async processEventJobs(jobs: UpdateJob<NormalizedEvent>[]): Promise<number> {
     if (jobs.length === 0) return 0;
-    await this.upsertEvents(jobs.map((job) => job.payload));
-    return jobs.length;
+
+    logger.debug('db-writer starting event job processing', {
+      jobCount: jobs.length,
+      jobIds: jobs.map(j => j.queuedAt),
+      polymarketIds: jobs.map(j => j.payload.polymarket_id)
+    });
+
+    try {
+      await this.upsertEvents(jobs.map((job) => job.payload));
+      logger.debug('db-writer completed event job processing', {
+        jobCount: jobs.length,
+        processedIds: jobs.map(j => j.payload.polymarket_id)
+      });
+      return jobs.length;
+    } catch (error) {
+      logger.error('db-writer failed to process event jobs', {
+        jobCount: jobs.length,
+        error: formatError(error),
+        jobIds: jobs.map(j => j.queuedAt),
+        polymarketIds: jobs.map(j => j.payload.polymarket_id)
+      });
+      throw error;
+    }
   }
 
   private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
     if (batch.length === 0) return;
+
+    logger.debug('db-writer starting event batch upsert', {
+      batchSize: batch.length,
+      polymarketIds: batch.map(e => e.polymarket_id)
+    });
+
     const now = new Date();
     const values = batch.map((event) => ({
       polymarketId: event.polymarket_id,
@@ -151,6 +248,12 @@ export class DbWriterWorker {
       updatedAt: now
     }));
 
+    logger.debug('db-writer executing events database upsert', {
+      recordCount: values.length,
+      targetConflictColumn: 'polymarketId'
+    });
+
+    const startTime = Date.now();
     await db
       .insert(events)
       .values(values)
@@ -174,6 +277,13 @@ export class DbWriterWorker {
           updatedAt: sql`excluded.updated_at`
         }
       });
+
+    const duration = Date.now() - startTime;
+    logger.debug('db-writer completed events database upsert', {
+      recordCount: values.length,
+      duration: `${duration}ms`,
+      avgTimePerRecord: `${Math.round(duration / values.length)}ms`
+    });
   }
 
   // ---------------------------
