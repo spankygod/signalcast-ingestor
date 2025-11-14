@@ -5,12 +5,24 @@ import logger, { formatError } from "../lib/logger";
 import { dbWriterWorkerV2 } from "./db-writer-v2";
 import { heartbeatMonitor } from "./heartbeat";
 
-logger.info("db-writer-v2 standalone starting");
+const workerId = process.env.WORKER_ID || 'unknown';
+const isScalable = process.env.IS_SCALABLE === 'true';
+
+logger.info("db-writer-v2 standalone starting", {
+  workerId,
+  isScalable,
+  nodeId: process.env.NODE_ENV || 'development'
+});
 
 // Start heartbeat monitor
+logger.info("db-writer-v2 starting heartbeat monitor");
 heartbeatMonitor.start();
 
 // Start db-writer worker
+logger.info("db-writer-v2 starting worker process", {
+  workerId,
+  targetQueue: "signalcast:queue:events, markets, outcomes, ticks"
+});
 dbWriterWorkerV2.start();
 
 const shutdown = async (signal: NodeJS.Signals) => {

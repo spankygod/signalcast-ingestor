@@ -99,6 +99,7 @@ export class EventsPoller {
           offset,
           limit,
           fetchedSoFar: fetched,
+          apiUrl: `/events?limit=${limit}&offset=${offset}&closed=false&order=createdAt&ascending=false`
         });
 
         const events = await polymarketClient.listEvents({
@@ -113,6 +114,7 @@ export class EventsPoller {
           eventsReceived: events.length,
           offset,
           limit,
+          apiUrl: `/events?limit=${limit}&offset=${offset}&closed=false&order=createdAt&ascending=false`
         });
 
         if (events.length === 0) {
@@ -130,6 +132,11 @@ export class EventsPoller {
 
         for (const event of filtered) {
           await pushUpdate("event", normalizeEvent(event));
+          logger.debug("[events-poller] queued event to Redis", {
+            eventId: event.id,
+            eventTitle: event.title,
+            polymarketId: event.id
+          });
         }
 
         fetched += events.length;
@@ -137,11 +144,13 @@ export class EventsPoller {
 
         heartbeatMonitor.beat(WORKERS.eventsPoller, { fetched, offset });
 
-        logger.info("[events-poller] page processed", {
+        logger.info("[events-poller] page processed and saved to Redis", {
           pageFetched: events.length,
           pageQueued: filtered.length,
           totalFetched: fetched,
           currentOffset: offset,
+          redisQueue: "signalcast:queue:events",
+          apiUrl: `/events?limit=${limit}&offset=${offset}&closed=false&order=createdAt&ascending=false`
         });
 
         if (events.length < limit) {

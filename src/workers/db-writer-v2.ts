@@ -213,11 +213,21 @@ export class DbWriterWorkerV2 {
       // Get bootstrap status to determine processing strategy
       const bootstrapStatus = await BootstrapCoordinator.getBootstrapStatus();
 
+      logger.debug("[db-writer-v2] drain cycle", {
+        bootstrapStatus,
+        retryQueueSize: this.retryQueue.size,
+        workerId: process.env.WORKER_ID || 'unknown'
+      });
+
       if (bootstrapStatus.complete) {
         // Normal operation: process all queues
+        logger.debug("[db-writer-v2] processing all queues (post-bootstrap)");
         await this.processAllQueues();
       } else {
         // Bootstrap mode: strict ordering with barriers
+        logger.debug("[db-writer-v2] processing in bootstrap mode", {
+          stage: this.getCurrentBootstrapStage(bootstrapStatus)
+        });
         await this.processBootstrapMode(bootstrapStatus);
       }
 
@@ -226,6 +236,13 @@ export class DbWriterWorkerV2 {
     } finally {
       this.draining = false;
     }
+  }
+
+  private getCurrentBootstrapStage(bootstrapStatus: any): string {
+    if (!bootstrapStatus.events) return "events";
+    if (!bootstrapStatus.markets) return "markets";
+    if (!bootstrapStatus.outcomes) return "outcomes";
+    return "complete";
   }
 
   private async processRetryQueue(): Promise<void> {
