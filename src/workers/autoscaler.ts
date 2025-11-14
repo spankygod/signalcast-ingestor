@@ -69,6 +69,18 @@ class Autoscaler {
 
       desiredWorkers = Math.min(desiredWorkers, MAX_WORKERS);
 
+      logger.info("[autoscale] queue check", {
+        queueLength: eventsQueueLength,
+        desiredWorkers,
+        thresholds: {
+          "5workers": 7000,
+          "4workers": 3000,
+          "3workers": 1000,
+          "2workers": 200,
+          "1worker": 0
+        }
+      });
+
       await this.scaleToWorkers(desiredWorkers);
 
     } catch (error) {
@@ -85,6 +97,13 @@ class Autoscaler {
 
     try {
       const currentWorkers = await this.getCurrentDbWriterWorkers();
+
+      logger.info("[autoscale] scaling evaluation", {
+        currentWorkers,
+        desiredCount,
+        action: currentWorkers === desiredCount ? "none" :
+                currentWorkers < desiredCount ? "scale_up" : "scale_down"
+      });
 
       if (currentWorkers === desiredCount) {
         return; // No scaling needed

@@ -44,6 +44,12 @@ export class EventsPoller {
   private async shouldPauseForBacklog(): Promise<boolean> {
     try {
       const backlog = await redis.llen(QUEUES.events);
+      logger.info("[events-poller] queue status check", {
+        backlog,
+        threshold: settings.eventQueueBacklogThreshold,
+        willPause: backlog >= settings.eventQueueBacklogThreshold,
+      });
+
       if (backlog >= settings.eventQueueBacklogThreshold) {
         logger.warn("[events-poller] pausing run due to event queue backlog", {
           backlog,
@@ -75,12 +81,25 @@ export class EventsPoller {
       ? settings.bootstrapEventsPageSize
       : settings.steadyEventsPageSize;
 
+    logger.info("[events-poller] starting poll cycle", {
+      isBootstrap,
+      pageSize: limit,
+      pollInterval: settings.eventsPollIntervalMs,
+    });
+
     try {
       while (true) {
         if (await this.shouldPauseForBacklog()) {
+          logger.info("[events-poller] throttling due to backlog, waiting...");
           await this.pageThrottle(isBootstrap);
           continue;
         }
+
+        logger.info("[events-poller] fetching events page", {
+          offset,
+          limit,
+          fetchedSoFar: fetched,
+        });
 
         const events = await polymarketClient.listEvents({
           limit,
@@ -90,9 +109,24 @@ export class EventsPoller {
           ascending: false,
         });
 
-        if (events.length === 0) break;
+        logger.info("[events-poller] received events from API", {
+          eventsReceived: events.length,
+          offset,
+          limit,
+        });
+
+        if (events.length === 0) {
+          logger.info("[events-poller] no more events available, ending poll cycle");
+          break;
+        }
 
         const filtered = politicsFilter.filterEvents(events);
+
+        logger.info("[events-poller] politics filter results", {
+          before: events.length,
+          after: filtered.length,
+          filteredOut: events.length - filtered.length,
+        });
 
         for (const event of filtered) {
           await pushUpdate("event", normalizeEvent(event));
@@ -103,17 +137,29 @@ export class EventsPoller {
 
         heartbeatMonitor.beat(WORKERS.eventsPoller, { fetched, offset });
 
+        logger.info("[events-poller] page processed", {
+          pageFetched: events.length,
+          pageQueued: filtered.length,
+          totalFetched: fetched,
+          currentOffset: offset,
+        });
+
         if (events.length < limit) {
-          // last page
+          logger.info("[events-poller] last page received (less than full page size)");
           break;
         }
 
+        logger.info("[events-poller] pausing before next page", {
+          delay: isBootstrap ? 1000 : 500,
+        });
         await this.pageThrottle(isBootstrap);
       }
 
       if (isBootstrap) {
         await bootstrap.setDone("events_done");
-        logger.info("[bootstrap] events initial load complete");
+        logger.info("[bootstrap] events initial load complete", {
+          totalEventsFetched: fetched,
+        });
       }
 
       logger.info(
@@ -122,10 +168,14 @@ export class EventsPoller {
     } catch (error) {
       logger.error("[events-poller] failed to poll events", {
         error: formatError(error),
+        fetched,
+        offset,
+        isBootstrap,
       });
     } finally {
       this.isRunning = false;
       heartbeatMonitor.markIdle(WORKERS.eventsPoller);
+      logger.info("[events-poller] poll cycle completed");
     }
   }
 }
