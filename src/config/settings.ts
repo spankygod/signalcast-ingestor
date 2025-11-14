@@ -4,6 +4,7 @@ export interface IngestorSettings {
   outcomesPollIntervalMs: number;
   heartbeatIntervalMs: number;
   queueDrainIntervalMs: number;
+  eventBatchSize: number;
   tickRetentionMinutes: number;
   maxConcurrentJobs: number;
   redisEnabled: boolean;
@@ -16,6 +17,7 @@ export const settings: IngestorSettings = {
   outcomesPollIntervalMs: Number(process.env.OUTCOMES_POLL_INTERVAL_MS || 90_000),
   heartbeatIntervalMs: Number(process.env.HEARTBEAT_INTERVAL_MS || 30_000),
   queueDrainIntervalMs: Number(process.env.QUEUE_DRAIN_INTERVAL_MS || 5_000),
+  eventBatchSize: Number(process.env.EVENT_BATCH_SIZE || 25),
   tickRetentionMinutes: Number(process.env.TICK_RETENTION_MINUTES || 60),
   maxConcurrentJobs: Number(process.env.MAX_CONCURRENT_JOBS || 4),
   redisEnabled: process.env.REDIS_ENABLED !== 'false',

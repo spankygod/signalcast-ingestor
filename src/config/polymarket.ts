@@ -29,6 +29,7 @@ export interface PolymarketMarket {
   question: string;
   description: string | null;
   slug: string;
+  conditionId?: string;
   eventId?: string;
   startDate: string | null;
   endDate: string | null;
@@ -53,6 +54,7 @@ export interface PolymarketMarket {
   marketMakerAddress?: string | null;
   imageUrl?: string;
   event?: PolymarketEvent;
+  clobTokenIds?: string[] | string | null;
 }
 
 export interface PolymarketEvent {

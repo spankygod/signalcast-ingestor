@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import logger, { formatError } from "../lib/logger";
 import { settings } from "../config/settings";
 import { polymarketClient } from "../config/polymarket";
@@ -14,6 +14,12 @@ import {
 import { NormalizedTick } from "../utils/normalizeTick";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
+
+type PipelineStage = {
+  kind: UpdateKind;
+  handler: (jobs: UpdateJob<any>[]) => Promise<number>;
+  batchSize: number;
+};
 
 export class DbWriterWorker {
   private timer: NodeJS.Timeout | null = null;
@@ -42,15 +48,31 @@ export class DbWriterWorker {
 
     try {
       let totalProcessed = 0;
-      const pipeline: Array<{ kind: UpdateKind; handler: (job: UpdateJob<any>) => Promise<boolean> }> = [
-        { kind: 'event', handler: (job) => this.processEventJob(job as UpdateJob<NormalizedEvent>) },
-        { kind: 'market', handler: (job) => this.processMarketJob(job as UpdateJob<NormalizedMarket>) },
-        { kind: 'outcome', handler: (job) => this.processOutcomeJob(job as UpdateJob<NormalizedOutcome>) },
-        { kind: 'tick', handler: (job) => this.processTickJob(job as UpdateJob<NormalizedTick>) }
+      const pipeline: PipelineStage[] = [
+        {
+          kind: 'event',
+          batchSize: Math.max(1, settings.eventBatchSize),
+          handler: (jobs) => this.processEventJobs(jobs as UpdateJob<NormalizedEvent>[])
+        },
+        {
+          kind: 'market',
+          batchSize: 1,
+          handler: (jobs) => this.processMarketJobs(jobs as UpdateJob<NormalizedMarket>[])
+        },
+        {
+          kind: 'outcome',
+          batchSize: 1,
+          handler: (jobs) => this.processOutcomeJobs(jobs as UpdateJob<NormalizedOutcome>[])
+        },
+        {
+          kind: 'tick',
+          batchSize: 1,
+          handler: (jobs) => this.processTickJobs(jobs as UpdateJob<NormalizedTick>[])
+        }
       ];
 
       for (const stage of pipeline) {
-        totalProcessed += await this.processQueue(stage.kind, stage.handler);
+        totalProcessed += await this.processQueue(stage);
       }
 
       if (totalProcessed === 0) {
@@ -63,29 +85,47 @@ export class DbWriterWorker {
     }
   }
 
-  private async processQueue(
-    kind: UpdateKind,
-    handler: (job: UpdateJob<any>) => Promise<boolean>
-  ): Promise<number> {
+  private async processQueue(stage: PipelineStage): Promise<number> {
     let processed = 0;
 
     while (true) {
-      const job = await pullNextUpdate(kind);
-      if (!job) break;
+      const jobs = await this.pullJobs(stage.kind, stage.batchSize);
+      if (jobs.length === 0) break;
 
-      const handled = await handler(job);
-      if (handled) {
-        processed += 1;
-        heartbeatMonitor.beat(WORKERS.dbWriter, { kind, processed });
+      const handled = await stage.handler(jobs);
+      if (handled > 0) {
+        processed += handled;
+        heartbeatMonitor.beat(WORKERS.dbWriter, { kind: stage.kind, processed });
       }
     }
 
     return processed;
   }
 
-  private async processEventJob(job: UpdateJob<NormalizedEvent>): Promise<boolean> {
-    await this.upsertEvent(job.payload);
-    return true;
+  private async pullJobs(kind: UpdateKind, max: number): Promise<Array<UpdateJob<any>>> {
+    const jobs: Array<UpdateJob<any>> = [];
+    for (let i = 0; i < max; i++) {
+      const job = await pullNextUpdate(kind);
+      if (!job) break;
+      jobs.push(job);
+    }
+    return jobs;
+  }
+
+  private async processEventJobs(jobs: UpdateJob<NormalizedEvent>[]): Promise<number> {
+    if (jobs.length === 0) return 0;
+    await this.upsertEvents(jobs.map(job => job.payload));
+    return jobs.length;
+  }
+
+  private async processMarketJobs(jobs: UpdateJob<NormalizedMarket>[]): Promise<number> {
+    let processed = 0;
+    for (const job of jobs) {
+      if (await this.processMarketJob(job)) {
+        processed += 1;
+      }
+    }
+    return processed;
   }
 
   private async processMarketJob(job: UpdateJob<NormalizedMarket>): Promise<boolean> {
@@ -99,6 +139,16 @@ export class DbWriterWorker {
     return true;
   }
 
+  private async processOutcomeJobs(jobs: UpdateJob<NormalizedOutcome>[]): Promise<number> {
+    let processed = 0;
+    for (const job of jobs) {
+      if (await this.processOutcomeJob(job)) {
+        processed += 1;
+      }
+    }
+    return processed;
+  }
+
   private async processOutcomeJob(job: UpdateJob<NormalizedOutcome>): Promise<boolean> {
     const outcome = job.payload;
     const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
@@ -108,6 +158,16 @@ export class DbWriterWorker {
 
     await this.upsertOutcome(outcome, marketId);
     return true;
+  }
+
+  private async processTickJobs(jobs: UpdateJob<NormalizedTick>[]): Promise<number> {
+    let processed = 0;
+    for (const job of jobs) {
+      if (await this.processTickJob(job)) {
+        processed += 1;
+      }
+    }
+    return processed;
   }
 
   private async processTickJob(job: UpdateJob<NormalizedTick>): Promise<boolean> {
@@ -121,8 +181,10 @@ export class DbWriterWorker {
     return true;
   }
 
-  private async upsertEvent(event: NormalizedEvent): Promise<void> {
-    const values = {
+  private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
+    if (batch.length === 0) return;
+    const now = new Date();
+    const values = batch.map((event) => ({
       polymarketId: event.polymarket_id,
       title: event.title,
       slug: event.slug,
@@ -137,17 +199,30 @@ export class DbWriterWorker {
       restricted: event.restricted,
       startDate: this.toDate(event.start_date),
       endDate: this.toDate(event.end_date),
-      lastIngestedAt: this.toDate(event.last_ingested_at) ?? new Date(),
-      updatedAt: new Date()
-    };
+      lastIngestedAt: this.toDate(event.last_ingested_at) ?? now,
+      updatedAt: now
+    }));
 
     await db.insert(events)
       .values(values)
       .onConflictDoUpdate({
         target: events.polymarketId,
         set: {
-          ...values,
-          updatedAt: new Date()
+          title: sql`excluded.title`,
+          slug: sql`excluded.slug`,
+          description: sql`excluded.description`,
+          category: sql`excluded.category`,
+          liquidity: sql`excluded.liquidity`,
+          volume24h: sql`excluded.volume_24h`,
+          volumeTotal: sql`excluded.volume_total`,
+          active: sql`excluded.active`,
+          closed: sql`excluded.closed`,
+          archived: sql`excluded.archived`,
+          restricted: sql`excluded.restricted`,
+          startDate: sql`excluded.start_date`,
+          endDate: sql`excluded.end_date`,
+          lastIngestedAt: sql`excluded.last_ingested_at`,
+          updatedAt: sql`excluded.updated_at`
         }
       });
   }
