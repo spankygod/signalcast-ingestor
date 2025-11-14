@@ -12,6 +12,7 @@ import {
   normalizeMarket
 } from "../utils/normalizeMarket";
 import { NormalizedTick } from "../utils/normalizeTick";
+import { sleep } from "../lib/retry";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
 
@@ -42,6 +43,7 @@ export class DbWriterWorker {
   }
 
   private async drain(): Promise<void> {
+    heartbeatMonitor.beat(WORKERS.dbWriter, { state: 'alive' });
     if (this.draining) return;
     this.draining = true;
     heartbeatMonitor.beat(WORKERS.dbWriter, { state: 'draining' });
@@ -56,12 +58,12 @@ export class DbWriterWorker {
         },
         {
           kind: 'market',
-          batchSize: 1,
+          batchSize: 50,
           handler: (jobs) => this.processMarketJobs(jobs as UpdateJob<NormalizedMarket>[])
         },
         {
           kind: 'outcome',
-          batchSize: 1,
+          batchSize: 100,
           handler: (jobs) => this.processOutcomeJobs(jobs as UpdateJob<NormalizedOutcome>[])
         },
         {
@@ -203,7 +205,9 @@ export class DbWriterWorker {
       updatedAt: now
     }));
 
-    await db.insert(events)
+    await this.withRateLimitHandling(
+      () =>
+        db.insert(events)
       .values(values)
       .onConflictDoUpdate({
         target: events.polymarketId,
@@ -224,7 +228,9 @@ export class DbWriterWorker {
           lastIngestedAt: sql`excluded.last_ingested_at`,
           updatedAt: sql`excluded.updated_at`
         }
-      });
+      }),
+      'events-upsert'
+    );
   }
 
   private async upsertMarket(market: NormalizedMarket, eventId: string): Promise<void> {
@@ -253,16 +259,20 @@ export class DbWriterWorker {
       updatedAt: new Date()
     };
 
-    await db.insert(markets)
-      .values(values)
-      .onConflictDoUpdate({
-        target: markets.polymarketId,
-        set: {
-          ...values,
-          updatedAt: new Date(),
-          lastIngestedAt: new Date()
-        }
-      });
+    await this.withRateLimitHandling(
+      () =>
+        db.insert(markets)
+        .values(values)
+        .onConflictDoUpdate({
+          target: markets.polymarketId,
+          set: {
+            ...values,
+            updatedAt: new Date(),
+            lastIngestedAt: new Date()
+          }
+        }),
+      'markets-upsert'
+    );
   }
 
   private async upsertOutcome(outcome: NormalizedOutcome, marketId: string): Promise<void> {
@@ -279,28 +289,36 @@ export class DbWriterWorker {
       updatedAt: new Date()
     };
 
-    await db.insert(outcomes)
-      .values(values)
-      .onConflictDoUpdate({
-        target: outcomes.polymarketId,
-        set: {
-          ...values,
-          updatedAt: new Date()
-        }
-      });
+    await this.withRateLimitHandling(
+      () =>
+        db.insert(outcomes)
+        .values(values)
+        .onConflictDoUpdate({
+          target: outcomes.polymarketId,
+          set: {
+            ...values,
+            updatedAt: new Date()
+          }
+        }),
+      'outcomes-upsert'
+    );
   }
 
   private async insertTick(tick: NormalizedTick, marketId: string): Promise<void> {
-    await db.insert(marketPricesRealtime).values({
-      marketId,
-      price: this.decimal(tick.price),
-      bestBid: this.decimal(tick.best_bid),
-      bestAsk: this.decimal(tick.best_ask),
-      lastTradePrice: this.decimal(tick.last_trade_price),
-      liquidity: this.decimal(tick.liquidity),
-      volume24h: this.decimal(tick.volume_24h),
-      updatedAt: this.toDate(tick.captured_at) ?? new Date()
-    });
+    await this.withRateLimitHandling(
+      () =>
+        db.insert(marketPricesRealtime).values({
+          marketId,
+          price: this.decimal(tick.price),
+          bestBid: this.decimal(tick.best_bid),
+          bestAsk: this.decimal(tick.best_ask),
+          lastTradePrice: this.decimal(tick.last_trade_price),
+          liquidity: this.decimal(tick.liquidity),
+          volume24h: this.decimal(tick.volume_24h),
+          updatedAt: this.toDate(tick.captured_at) ?? new Date()
+        }),
+      'ticks-insert'
+    );
   }
 
   private async handleMissingEventForMarket(
@@ -458,6 +476,29 @@ export class DbWriterWorker {
     if (value instanceof Date) return value;
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  private async withRateLimitHandling<T>(operation: () => Promise<T>, context: string): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (this.isRateLimitError(error)) {
+        const delay = Number(process.env.DB_RATE_LIMIT_BACKOFF_MS || 500);
+        logger.warn('db-writer rate limit detected, backing off', {
+          context,
+          delay,
+          error: formatError(error)
+        });
+        await sleep(delay);
+      }
+      throw error;
+    }
+  }
+
+  private isRateLimitError(error: unknown): boolean {
+    if (!error) return false;
+    const message = error instanceof Error ? error.message : String(error);
+    return message.toLowerCase().includes('too many concurrent writes');
   }
 }
 
