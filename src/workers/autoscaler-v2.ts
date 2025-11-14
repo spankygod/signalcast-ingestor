@@ -79,18 +79,27 @@ export class AutoscalerV2 {
 
   private async acquireCoordinationLock(): Promise<boolean> {
     try {
+      console.log("[AUTOSCALER-DEBUG] Attempting Redis SET with coordination lock...");
+      const lockData = JSON.stringify({
+        hostname: process.env.HOSTNAME || 'unknown',
+        pid: process.pid,
+        startTime: Date.now()
+      });
+      console.log("[AUTOSCALER-DEBUG] Lock data:", lockData);
+
       const result = await redis.setWithEX(
         this.coordinationKey,
-        JSON.stringify({
-          hostname: process.env.HOSTNAME || 'unknown',
-          pid: process.pid,
-          startTime: Date.now()
-        }),
+        lockData,
         COORDINATION_LOCK_TTL
       );
 
+      console.log("[AUTOSCALER-DEBUG] Redis SET result:", result);
+      console.log("[AUTOSCALER-DEBUG] Expected result: OK");
+      console.log("[AUTOSCALER-DEBUG] Will return:", result === "OK");
+
       return result === "OK";
     } catch (error) {
+      console.log("[AUTOSCALER-DEBUG] Exception in acquireCoordinationLock:", error);
       logger.error("[autoscaler-v2] failed to acquire coordination lock", {
         error: formatError(error)
       });
