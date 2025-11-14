@@ -223,13 +223,15 @@ export class DbWriterWorker {
   private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
     if (batch.length === 0) return;
 
+    const uniqueBatch = this.dedupeBatch(batch, (event) => event.polymarket_id, 'events');
+
     logger.debug('db-writer starting event batch upsert', {
-      batchSize: batch.length,
-      polymarketIds: batch.map(e => e.polymarket_id)
+      batchSize: uniqueBatch.length,
+      polymarketIds: uniqueBatch.map(e => e.polymarket_id)
     });
 
     const now = new Date();
-    const values = batch.map((event) => ({
+    const values = uniqueBatch.map((event) => ({
       polymarketId: event.polymarket_id,
       title: event.title,
       slug: event.slug,
@@ -282,7 +284,7 @@ export class DbWriterWorker {
     logger.debug('db-writer completed events database upsert', {
       recordCount: values.length,
       duration: `${duration}ms`,
-      avgTimePerRecord: `${Math.round(duration / values.length)}ms`
+      avgTimePerRecord: `${Math.round(duration / Math.max(values.length, 1))}ms`
     });
   }
 
@@ -722,6 +724,28 @@ export class DbWriterWorker {
     if (value instanceof Date) return value;
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
+  }
+
+  private dedupeBatch<T>(
+    items: T[],
+    keySelector: (item: T) => string,
+    context: string
+  ): T[] {
+    const map = new Map<string, T>();
+    for (const item of items) {
+      const key = keySelector(item);
+      if (!key) continue;
+      map.set(key, item);
+    }
+
+    if (map.size !== items.length) {
+      logger.debug(`db-writer deduped ${context} batch`, {
+        original: items.length,
+        unique: map.size
+      });
+    }
+
+    return Array.from(map.values());
   }
 }
 
