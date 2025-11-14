@@ -6,10 +6,14 @@ import { normalizeOutcome } from '../utils/normalizeMarket';
 import { heartbeatMonitor } from './heartbeat';
 import { WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
+import { bootstrap } from '../lib/bootstrap';
 
 export class OutcomesPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
+  private async slowBootstrapSleep() {
+    return new Promise(res => setTimeout(res, 1000)); // 1s
+  }
 
   start(): void {
     if (this.timer) return;
@@ -38,10 +42,25 @@ export class OutcomesPoller {
     this.isRunning = true;
     heartbeatMonitor.beat(WORKERS.outcomesPoller);
     let offset = 0;
-    const limit = 100;
     let fetched = 0;
 
     try {
+      const eventsDone = await bootstrap.isDone("events_done");
+      if (!eventsDone) {
+        logger.info("[bootstrap] waiting for events to finish before outcomes");
+        await this.slowBootstrapSleep();
+        return;
+      }
+
+      const marketsDone = await bootstrap.isDone("markets_done");
+      if (!marketsDone) {
+        logger.info("[bootstrap] waiting for markets to finish before outcomes");
+        await this.slowBootstrapSleep();
+        return;
+      }
+
+      const limit = 100;
+
       while (true) {
         const markets = await polymarketClient.listMarkets({
           limit,

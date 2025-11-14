@@ -39,3 +39,10 @@ export async function pullNextUpdate<T>(kind: UpdateKind): Promise<UpdateJob<T> 
     attempts: job.attempts ?? 0
   };
 }
+
+export async function requeueUpdate<T>(
+  kind: UpdateKind,
+  job: UpdateJob<T>
+): Promise<void> {
+  await pushUpdate(kind, job.payload, (job.attempts ?? 0) + 1);
+}

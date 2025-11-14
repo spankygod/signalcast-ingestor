@@ -28,6 +28,10 @@ class NoOpRedis {
     return null;
   }
 
+  async set(): Promise<void> {
+    // No-op when Redis is not available
+  }
+
   async del(): Promise<void> {
     // No-op when Redis is not available
   }
@@ -153,6 +157,14 @@ const redisFallback = {
     }
     scheduleReconnect();
     return null;
+  },
+
+  async set(key: string, value: string): Promise<void> {
+    if (redisAvailable && redisInstance) {
+      await redisInstance.set(key, value);
+    } else {
+      scheduleReconnect();
+    }
   },
 
   async del(key: string): Promise<void> {

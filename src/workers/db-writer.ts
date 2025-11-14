@@ -3,6 +3,7 @@ import logger, { formatError } from "../lib/logger";
 import { polymarketClient } from "../config/polymarket";
 import {
   pullNextUpdate,
+  requeueUpdate,
   UpdateJob,
   UpdateKind
 } from "../queues/updates.queue";
@@ -23,12 +24,21 @@ import {
 import { NormalizedTick } from "../utils/normalizeTick";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
+import { bootstrap } from "../lib/bootstrap";
+import { pushUpdate } from "../queues/updates.queue";
 
 const JOB_MAX_ATTEMPTS = Number(process.env.JOB_MAX_ATTEMPTS || 3);
 
 export class DbWriterWorker {
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
+
+  private readonly PIPELINE = [
+    { kind: "event", batchSize: 50, handler: this.processEventBatch.bind(this) },
+    { kind: "market", batchSize: 50, handler: this.processMarketBatch.bind(this) },
+    { kind: "outcome", batchSize: 100, handler: this.processOutcomeBatch.bind(this) },
+    { kind: "tick", batchSize: 300, handler: this.processTickBatch.bind(this) }
+  ];
 
   start(): void {
     if (this.timer) return;
@@ -47,7 +57,7 @@ export class DbWriterWorker {
   }
 
   // -------------------------------------------------------------------
-  // Main pipeline — STRICT ORDER: events → markets → outcomes → ticks
+  // Main pipeline - STRICT ORDER: events -> markets -> outcomes -> ticks
   // -------------------------------------------------------------------
 
   private async drain(): Promise<void> {
@@ -57,53 +67,17 @@ export class DbWriterWorker {
     try {
       let totalProcessed = 0;
 
-      // 1) EVENTS (parents-of-all)
-      const eventsProcessed = await this.processQueue(
-        "event",
-        20,
-        (jobs) => this.processEventBatch(jobs as UpdateJob<NormalizedEvent>[])
-      );
-      totalProcessed += eventsProcessed;
-      heartbeatMonitor.beat(WORKERS.dbWriter, {
-        stage: "event",
-        processed: eventsProcessed
-      });
-
-      // 2) MARKETS (children of events, parents of outcomes/ticks)
-      const marketsProcessed = await this.processQueue(
-        "market",
-        20,
-        (jobs) => this.processMarketBatch(jobs as UpdateJob<NormalizedMarket>[])
-      );
-      totalProcessed += marketsProcessed;
-      heartbeatMonitor.beat(WORKERS.dbWriter, {
-        stage: "market",
-        processed: marketsProcessed
-      });
-
-      // 3) OUTCOMES (children of markets)
-      const outcomesProcessed = await this.processQueue(
-        "outcome",
-        50,
-        (jobs) => this.processOutcomeBatch(jobs as UpdateJob<NormalizedOutcome>[])
-      );
-      totalProcessed += outcomesProcessed;
-      heartbeatMonitor.beat(WORKERS.dbWriter, {
-        stage: "outcome",
-        processed: outcomesProcessed
-      });
-
-      // 4) TICKS (children of markets, insert-only)
-      const ticksProcessed = await this.processQueue(
-        "tick",
-        100,
-        (jobs) => this.processTickBatch(jobs as UpdateJob<NormalizedTick>[])
-      );
-      totalProcessed += ticksProcessed;
-      heartbeatMonitor.beat(WORKERS.dbWriter, {
-        stage: "tick",
-        processed: ticksProcessed
-      });
+      for (const stage of this.PIPELINE) {
+        let processed;
+        do {
+          processed = await this.processQueue(stage.kind as UpdateKind, stage.batchSize, stage.handler);
+          totalProcessed += processed;
+          heartbeatMonitor.beat(WORKERS.dbWriter, {
+            stage: stage.kind,
+            processed: processed
+          });
+        } while (processed > 0);
+      }
 
       if (totalProcessed === 0) {
         heartbeatMonitor.beat(WORKERS.dbWriter, { state: "idle" });
@@ -246,11 +220,15 @@ export class DbWriterWorker {
 
       const eventId = await this.ensureEventExists(m.event_polymarket_id);
       if (!eventId) {
-        // can't guarantee parent, skip this market
-        logger.warn("db-writer skipping market with missing parent event", {
-          marketPolymarketId: m.polymarket_id,
+        // can't guarantee parent, skip or requeue this market
+        logger.warn("skipping market with missing parent event", {
           eventPolymarketId: m.event_polymarket_id
         });
+
+        // ONLY requeue if bootstrap is done
+        if (await bootstrap.isDone("events_done")) {
+          await requeueUpdate("market", job);
+        }
         continue;
       }
 
@@ -349,10 +327,15 @@ export class DbWriterWorker {
 
       const marketId = await this.ensureMarketExists(o.market_polymarket_id);
       if (!marketId) {
-        logger.warn("db-writer skipping outcome with missing parent market", {
+        logger.warn("skipping outcome with missing parent market", {
           outcomePolymarketId: o.polymarket_id,
           marketPolymarketId: o.market_polymarket_id
         });
+
+        // ONLY requeue if bootstrap is done
+        if (await bootstrap.isDone("events_done")) {
+          await requeueUpdate("outcome", job);
+        }
         continue;
       }
 

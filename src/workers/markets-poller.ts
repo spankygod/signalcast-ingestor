@@ -7,6 +7,7 @@ import { heartbeatMonitor } from './heartbeat';
 import { QUEUES, WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
 import { redis } from '../lib/redis';
+import { bootstrap } from '../lib/bootstrap';
 
 // LRU Cache implementation to prevent memory leaks
 class LRUCache<K, V> {
@@ -75,6 +76,10 @@ export class MarketsPoller {
   // 10k events, 1h TTL – good even for Pro tier
   private knownEvents = new LRUCache<string, boolean>(10000, 60 * 60 * 1000);
 
+  private async slowBootstrapSleep() {
+    return new Promise(res => setTimeout(res, 1000)); // 1s
+  }
+
   start(): void {
     if (this.timer) return;
 
@@ -117,11 +122,19 @@ export class MarketsPoller {
       return;
     }
 
+    // Wait for events to be loaded before proceeding
+    const eventsDone = await bootstrap.isDone("events_done");
+    if (!eventsDone) {
+      logger.info("[bootstrap] waiting for events to finish before markets");
+      await this.slowBootstrapSleep();
+      return;
+    }
+
     this.isRunning = true;
     heartbeatMonitor.beat(WORKERS.marketsPoller, { state: 'running' });
 
     let offset = 0;
-    const limit = 100; // you can experiment with 200 on Pro
+    const limit = eventsDone ? 100 : 25; // small pages before bootstrap complete
     let fetched = 0;
     let politicsFiltered = 0;
     let queuedUpdates = 0;
@@ -149,6 +162,13 @@ export class MarketsPoller {
           }
 
           await this.ensureEventQueued(eventId, market.event);
+
+          // Only queue markets if events are done
+          const eventsDoneAgain = await bootstrap.isDone("events_done");
+          if (!eventsDoneAgain) {
+            return; // Do not queue markets before events exist
+          }
+
           await pushUpdate('market', normalizeMarket(market, { id: eventId }));
           queuedUpdates++;
         }
@@ -165,6 +185,17 @@ export class MarketsPoller {
         });
 
         if (markets.length < limit) break;
+
+        // Throttle during bootstrap
+        if (!eventsDone) {
+          await this.slowBootstrapSleep();
+        }
+      }
+
+      // Set bootstrap flag when complete
+      if (!eventsDone) {
+        await bootstrap.setDone("markets_done");
+        logger.info("[bootstrap] markets initial load complete");
       }
 
       const politicsPercent = fetched > 0 ? ((politicsFiltered / fetched) * 100).toFixed(1) : '0.0';

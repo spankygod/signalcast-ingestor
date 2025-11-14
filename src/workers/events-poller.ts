@@ -6,10 +6,15 @@ import { normalizeEvent } from '../utils/normalizeMarket';
 import { heartbeatMonitor } from './heartbeat';
 import { WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
+import { bootstrap } from '../lib/bootstrap';
 
 export class EventsPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
+
+  private async slowBootstrapSleep() {
+    return new Promise(res => setTimeout(res, 1000)); // 1s
+  }
 
   start(): void {
     if (this.timer) return;
@@ -38,10 +43,12 @@ export class EventsPoller {
     this.isRunning = true;
     heartbeatMonitor.beat(WORKERS.eventsPoller);
     let offset = 0;
-    const limit = 100;
     let fetched = 0;
 
     try {
+      const eventsDone = await bootstrap.isDone("events_done");
+      const limit = eventsDone ? 100 : 25; // small pages before bootstrap complete
+
       while (true) {
         const events = await polymarketClient.listEvents({
           limit,
@@ -62,9 +69,20 @@ export class EventsPoller {
         offset += limit;
         heartbeatMonitor.beat(WORKERS.eventsPoller, { fetched, offset });
 
-        if (events.length < limit || fetched > 1000) {
+        if (events.length < limit) {
           break;
         }
+
+        // Throttle during bootstrap
+        if (!eventsDone) {
+          await this.slowBootstrapSleep();
+        }
+      }
+
+      // Set bootstrap flag when complete
+      if (!eventsDone) {
+        await bootstrap.setDone("events_done");
+        logger.info("[bootstrap] events initial load complete");
       }
 
       logger.info(`[events-poller] run finished fetched=${fetched} offset=${offset}`);
