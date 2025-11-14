@@ -337,11 +337,13 @@ export class AutoscalerV2 {
         const workerName = `db-writer-${i}`;
 
         pm2.start({
-          script: "dist/workers/db-writer-standalone.js",
+          script: "dist/workers/db-writer-standalone-v2.js",
           name: workerName,
           instances: 1,
-          autorestart: false,
-          max_restarts: 0,
+          autorestart: true,
+          max_restarts: 5,
+          restart_delay: 2000,
+          min_uptime: 10_000,
           env: {
             WORKER_ID: i.toString(),
             IS_SCALABLE: "true"

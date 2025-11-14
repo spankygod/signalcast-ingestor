@@ -202,10 +202,30 @@ const connectionString: string = rawConnectionString;
 
 let clientInstance: ReturnType<typeof postgres> | null = null;
 
+function resolvePoolSize(): number {
+  const configuredPerProcess = Number(process.env.DB_POOL_MAX_PER_PROCESS || 0);
+  if (configuredPerProcess > 0) {
+    return Math.max(1, configuredPerProcess);
+  }
+
+  const globalBudget = Number(process.env.DB_POOL_BUDGET || process.env.DB_POOL_MAX || 10);
+  const autoscalerBudget = Number(process.env.DB_WRITER_MAX_PROCESSES || process.env.MAX_DB_WRITERS || 5);
+  const isDbWriterProcess =
+    process.env.IS_SCALABLE === "true" ||
+    Boolean(process.env.WORKER_ID);
+
+  if (!isDbWriterProcess) {
+    return Math.max(1, Math.min(globalBudget, Number(process.env.DB_POOL_MAX_NON_WRITER || globalBudget)));
+  }
+
+  const derivedPerProcess = Math.max(1, Math.floor(globalBudget / Math.max(1, autoscalerBudget)));
+  return derivedPerProcess;
+}
+
 function getClient() {
   if (!clientInstance) {
     clientInstance = postgres(connectionString, {
-      max: Number(process.env.DB_POOL_MAX || 5),
+      max: resolvePoolSize(),
       idle_timeout: Number(process.env.DB_IDLE_TIMEOUT || 30),
       connect_timeout: Number(process.env.DB_CONN_TIMEOUT || 15),
       max_lifetime: 60 * 30,

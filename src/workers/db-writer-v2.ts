@@ -32,23 +32,167 @@ interface RetryableJob extends UpdateJob<any> {
   attempts: number;
   lastAttempt: number;
   nextRetryAt: number;
+  reason?: string;
 }
 
 export class DbWriterWorkerV2 {
   private timer: NodeJS.Timeout | null = null;
   private draining = false;
   private retryQueue = new Map<string, RetryableJob>();
+  private starting = false;
 
   // Configuration
   private readonly DRAIN_INTERVAL = 1000; // Increased from 200ms
   private readonly MAX_RETRY_ATTEMPTS = 5;
   private readonly RETRY_BACKOFF_MS = [5000, 15000, 45000, 120000, 300000];
+  private readonly RETRY_STORAGE_PREFIX = "signalcast:retry:db-writer";
+  private readonly RETRY_STORAGE_TTL_SECONDS = 60 * 60 * 24; // 24h
+
+  private getJobIdentifier(job: UpdateJob<any>): string {
+    const payload = job.payload as Record<string, unknown>;
+    return (
+      (payload?.polymarket_id as string | undefined) ||
+      (payload?.market_polymarket_id as string | undefined) ||
+      (payload?.event_polymarket_id as string | undefined) ||
+      (payload?.id as string | undefined) ||
+      job.queuedAt ||
+      Math.random().toString(36).slice(2)
+    );
+  }
+
+  private getRetryJobKey(job: UpdateJob<any>): string {
+    return `${job.kind}:${this.getJobIdentifier(job)}`;
+  }
+
+  private getPersistedRetryKey(jobKey: string): string {
+    return `${this.RETRY_STORAGE_PREFIX}:${jobKey}`;
+  }
+
+  private async restorePersistedRetries(): Promise<void> {
+    try {
+      const pattern = `${this.RETRY_STORAGE_PREFIX}:*`;
+      const keys = await redis.keys(pattern);
+      if (!keys.length) return;
+
+      let restored = 0;
+      for (const key of keys) {
+        const payload = await redis.get(key);
+        if (!payload) continue;
+        try {
+          const job = JSON.parse(payload) as RetryableJob;
+          if (!job || typeof job.nextRetryAt !== "number") continue;
+          const jobKey = key.slice(this.RETRY_STORAGE_PREFIX.length + 1);
+          this.retryQueue.set(jobKey, job);
+          restored++;
+        } catch (error) {
+          logger.warn("[db-writer-v2] failed to parse persisted retry job", {
+            key,
+            error: formatError(error)
+          });
+        }
+      }
+
+      if (restored > 0) {
+        logger.info("[db-writer-v2] restored retry queue from redis", {
+          restored
+        });
+      }
+    } catch (error) {
+      logger.error("[db-writer-v2] failed to restore retry queue", {
+        error: formatError(error)
+      });
+    }
+  }
+
+  private async persistRetryJob(jobKey: string, job: RetryableJob): Promise<void> {
+    try {
+      await redis.setWithEX(
+        this.getPersistedRetryKey(jobKey),
+        JSON.stringify(job),
+        this.RETRY_STORAGE_TTL_SECONDS
+      );
+    } catch (error) {
+      logger.warn("[db-writer-v2] failed to persist retry job", {
+        jobKey,
+        error: formatError(error)
+      });
+    }
+  }
+
+  private async removePersistedRetry(jobKey: string): Promise<void> {
+    try {
+      await redis.del(this.getPersistedRetryKey(jobKey));
+    } catch (error) {
+      logger.warn("[db-writer-v2] failed to delete persisted retry job", {
+        jobKey,
+        error: formatError(error)
+      });
+    }
+  }
+
+  private async scheduleRetryJob(
+    job: UpdateJob<any>,
+    reason: string,
+    attempts = job.attempts ?? 0
+  ): Promise<void> {
+    const nextAttempt = attempts + 1;
+    if (nextAttempt > this.MAX_RETRY_ATTEMPTS) {
+      logger.error("[db-writer-v2] retry limit hit", {
+        kind: job.kind,
+        reason,
+        attempts: nextAttempt
+      });
+      return;
+    }
+
+    const backoffMs =
+      this.RETRY_BACKOFF_MS[
+        Math.min(nextAttempt - 1, this.RETRY_BACKOFF_MS.length - 1)
+      ] ?? this.RETRY_BACKOFF_MS[this.RETRY_BACKOFF_MS.length - 1] ?? 300000;
+
+    const retryJob: RetryableJob = {
+      ...job,
+      attempts: nextAttempt,
+      lastAttempt: Date.now(),
+      nextRetryAt: Date.now() + backoffMs,
+      reason
+    };
+
+    const jobKey = this.getRetryJobKey(job);
+    this.retryQueue.set(jobKey, retryJob);
+    await this.persistRetryJob(jobKey, retryJob);
+
+    logger.warn("[db-writer-v2] job scheduled for retry", {
+      kind: job.kind,
+      reason,
+      attempt: nextAttempt,
+      nextRetryIn: backoffMs
+    });
+  }
 
   start(): void {
-    if (this.timer) return;
+    if (this.timer || this.starting) return;
+    this.starting = true;
     logger.info("[db-writer-v2] starting with improved batch processing");
-    this.timer = setInterval(() => void this.drain(), this.DRAIN_INTERVAL);
-    void this.drain();
+    void this.boot();
+  }
+
+  private async boot(): Promise<void> {
+    try {
+      await this.restorePersistedRetries();
+      this.timer = setInterval(() => void this.drain(), this.DRAIN_INTERVAL);
+      await this.drain();
+    } catch (error) {
+      logger.error("[db-writer-v2] failed to initialize", {
+        error: formatError(error)
+      });
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+    } finally {
+      this.starting = false;
+    }
   }
 
   stop(): void {
@@ -88,11 +232,11 @@ export class DbWriterWorkerV2 {
     if (this.retryQueue.size === 0) return;
 
     const now = Date.now();
-    const readyJobs: RetryableJob[] = [];
+    const readyJobs: { key: string; job: RetryableJob }[] = [];
 
     for (const [jobId, job] of this.retryQueue.entries()) {
       if (job.nextRetryAt <= now) {
-        readyJobs.push(job);
+        readyJobs.push({ key: jobId, job });
         this.retryQueue.delete(jobId);
       }
     }
@@ -104,12 +248,15 @@ export class DbWriterWorkerV2 {
       remainingInQueue: this.retryQueue.size
     });
 
-    for (const job of readyJobs) {
-      await this.retryJob(job);
+    for (const { key, job } of readyJobs) {
+      const success = await this.retryJob(job);
+      if (success) {
+        await this.removePersistedRetry(key);
+      }
     }
   }
 
-  private async retryJob(job: RetryableJob): Promise<void> {
+  private async retryJob(job: RetryableJob): Promise<boolean> {
     try {
       switch (job.kind) {
         case "event":
@@ -128,35 +275,23 @@ export class DbWriterWorkerV2 {
 
       logger.info("[db-writer-v2] retry successful", {
         kind: job.kind,
-        attempts: job.attempts + 1
+        attempts: job.attempts,
+        reason: job.reason
       });
 
+      return true;
     } catch (error) {
-      const nextAttempt = job.attempts + 1;
-      if (nextAttempt >= this.MAX_RETRY_ATTEMPTS) {
-        logger.error("[db-writer-v2] retry exhausted, dropping job", {
-          kind: job.kind,
-          attempts: nextAttempt,
-          error: formatError(error)
-        });
-      } else {
-        const backoffMs = this.RETRY_BACKOFF_MS[Math.min(nextAttempt - 1, this.RETRY_BACKOFF_MS.length - 1)] || 300000;
-        const retryJob: RetryableJob = {
-          ...job,
-          attempts: nextAttempt,
-          lastAttempt: Date.now(),
-          nextRetryAt: Date.now() + backoffMs
-        };
-
-        const jobId = `${job.kind}_${job.payload.polymarket_id || Date.now()}_${Math.random()}`;
-        this.retryQueue.set(jobId, retryJob);
-
-        logger.warn("[db-writer-v2] job scheduled for retry", {
-          kind: job.kind,
-          attempt: nextAttempt,
-          nextRetryIn: backoffMs
-        });
-      }
+      await this.scheduleRetryJob(
+        job,
+        job.reason || "retry failure",
+        job.attempts ?? 0
+      );
+      logger.error("[db-writer-v2] retry failed", {
+        kind: job.kind,
+        attemptsTried: job.attempts,
+        error: formatError(error)
+      });
+      return false;
     }
   }
 
@@ -321,15 +456,7 @@ export class DbWriterWorkerV2 {
 
         // Add failed jobs to retry queue
         for (const job of jobs) {
-          const retryJob: RetryableJob = {
-            ...job,
-            attempts: 0,
-            lastAttempt: Date.now(),
-            nextRetryAt: Date.now() + (this.RETRY_BACKOFF_MS[0] || 5000)
-          };
-
-          const jobId = `${job.kind}_${job.payload.polymarket_id || Date.now()}_${Math.random()}`;
-          this.retryQueue.set(jobId, retryJob);
+          await this.scheduleRetryJob(job, "batch failure", job.attempts ?? 0);
         }
       }
 
@@ -419,9 +546,8 @@ export class DbWriterWorkerV2 {
   ): Promise<number> {
     if (!jobs.length) return 0;
 
-    const payloads = jobs.map((j) => j.payload);
     const eventIds = Array.from(
-      new Set(payloads.map((m) => m.event_polymarket_id)),
+      new Set(jobs.map((j) => j.payload.event_polymarket_id)),
     );
 
     // Batch fetch parent events with retry logic
@@ -437,22 +563,26 @@ export class DbWriterWorkerV2 {
     const now = new Date();
 
     const ready: { m: NormalizedMarket; eventId: string }[] = [];
-    const missingParents: NormalizedMarket[] = [];
+    let missingParents = 0;
 
-    for (const m of payloads) {
-      const parentId = parentMap.get(m.event_polymarket_id);
+    for (const job of jobs) {
+      const market = job.payload;
+      const parentId = parentMap.get(market.event_polymarket_id);
       if (!parentId) {
-        missingParents.push(m);
-      } else {
-        ready.push({ m, eventId: parentId });
+        missingParents++;
+        await this.scheduleRetryJob(
+          job,
+          `missing parent event ${market.event_polymarket_id}`,
+          job.attempts ?? 0
+        );
+        continue;
       }
+      ready.push({ m: market, eventId: parentId });
     }
 
-    // Log missing parents but don't fail the batch
-    if (missingParents.length > 0) {
-      logger.warn("[db-writer-v2] markets with missing parent events", {
-        missingCount: missingParents.length,
-        missingEvents: missingParents.slice(0, 3).map(m => m.event_polymarket_id)
+    if (missingParents > 0) {
+      logger.warn("[db-writer-v2] markets waiting on parent events", {
+        missingCount: missingParents
       });
     }
 
@@ -521,9 +651,8 @@ export class DbWriterWorkerV2 {
   ): Promise<number> {
     if (!jobs.length) return 0;
 
-    const payloads = jobs.map((j) => j.payload);
     const marketIds = Array.from(
-      new Set(payloads.map((o) => o.market_polymarket_id)),
+      new Set(jobs.map((j) => j.payload.market_polymarket_id)),
     );
 
     const parentRows = await dbInstance
@@ -538,19 +667,26 @@ export class DbWriterWorkerV2 {
     const now = new Date();
 
     const ready: { o: NormalizedOutcome; marketId: string }[] = [];
-    const missingParents: NormalizedOutcome[] = [];
+    let missingParents = 0;
 
-    for (const o of payloads) {
-      const parentId = parentMap.get(o.market_polymarket_id);
-      if (!parentId) missingParents.push(o);
-      else ready.push({ o, marketId: parentId });
+    for (const job of jobs) {
+      const outcome = job.payload;
+      const parentId = parentMap.get(outcome.market_polymarket_id);
+      if (!parentId) {
+        missingParents++;
+        await this.scheduleRetryJob(
+          job,
+          `missing parent market ${outcome.market_polymarket_id}`,
+          job.attempts ?? 0
+        );
+        continue;
+      }
+      ready.push({ o: outcome, marketId: parentId });
     }
 
-    // Log missing parents
-    if (missingParents.length > 0) {
-      logger.warn("[db-writer-v2] outcomes with missing parent markets", {
-        missingCount: missingParents.length,
-        missingMarkets: missingParents.slice(0, 3).map(o => o.market_polymarket_id)
+    if (missingParents > 0) {
+      logger.warn("[db-writer-v2] outcomes waiting on parent markets", {
+        missingCount: missingParents
       });
     }
 
@@ -594,9 +730,8 @@ export class DbWriterWorkerV2 {
   ): Promise<number> {
     if (!jobs.length) return 0;
 
-    const payloads = jobs.map((j) => j.payload);
     const marketIds = Array.from(
-      new Set(payloads.map((t) => t.market_polymarket_id)),
+      new Set(jobs.map((j) => j.payload.market_polymarket_id)),
     );
 
     const parentRows = await dbInstance
@@ -608,22 +743,31 @@ export class DbWriterWorkerV2 {
       .where(inArray(markets.polymarketId, marketIds));
 
     const parentMap = new Map(parentRows.map((r) => [r.polymarketId, r.id]));
-    const batch = payloads
-      .map((t) => {
-        const mId = parentMap.get(t.market_polymarket_id);
-        if (!mId) return null;
-        return {
-          marketId: mId,
-          price: t.price?.toString() ?? null,
-          bestBid: t.best_bid?.toString() ?? null,
-          bestAsk: t.best_ask?.toString() ?? null,
-          lastTradePrice: t.last_trade_price?.toString() ?? null,
-          liquidity: t.liquidity?.toString() ?? null,
-          volume24h: t.volume_24h?.toString() ?? null,
-          updatedAt: t.captured_at ? new Date(t.captured_at) : new Date(),
-        };
-      })
-      .filter(Boolean) as any[];
+    const batch = [];
+
+    for (const job of jobs) {
+      const tick = job.payload;
+      const marketId = parentMap.get(tick.market_polymarket_id);
+      if (!marketId) {
+        await this.scheduleRetryJob(
+          job,
+          `missing parent market for tick ${tick.market_polymarket_id}`,
+          job.attempts ?? 0
+        );
+        continue;
+      }
+
+      batch.push({
+        marketId,
+        price: tick.price?.toString() ?? null,
+        bestBid: tick.best_bid?.toString() ?? null,
+        bestAsk: tick.best_ask?.toString() ?? null,
+        lastTradePrice: tick.last_trade_price?.toString() ?? null,
+        liquidity: tick.liquidity?.toString() ?? null,
+        volume24h: tick.volume_24h?.toString() ?? null,
+        updatedAt: tick.captured_at ? new Date(tick.captured_at) : new Date(),
+      });
+    }
 
     if (!batch.length) return 0;
 

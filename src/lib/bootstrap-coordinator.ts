@@ -9,18 +9,26 @@ interface QueueBarrier {
 }
 
 export class BootstrapCoordinator {
-  private static readonly BARRIER_TTL = 300; // 5 minutes
+  private static readonly CHECKPOINT_TTL = 300; // 5 minutes
   private static readonly LOCK_TTL = 60; // 1 minute
+
+  private static stageKey(stage: "events" | "markets" | "outcomes"): string {
+    return `bootstrap:stage:${stage}`;
+  }
+
+  private static checkpointKey(stage: "events" | "markets" | "outcomes"): string {
+    return `bootstrap:check:${stage}`;
+  }
 
   static async waitForStage(
     stage: "events" | "markets" | "outcomes",
     maxWaitMs = 300_000
   ): Promise<boolean> {
-    const barrierKey = `bootstrap:barrier:${stage}`;
-    const checkKey = `bootstrap:check:${stage}`;
+    const barrierKey = this.stageKey(stage);
+    const checkKey = this.checkpointKey(stage);
 
-    // Set our checkpoint
-    await redis.setex(checkKey, this.BARRIER_TTL, Date.now().toString());
+    // Set our checkpoint so other workers know we are waiting
+    await redis.setex(checkKey, this.CHECKPOINT_TTL, Date.now().toString());
 
     logger.info(`[bootstrap-coordinator] waiting for ${stage} stage barrier`);
 
@@ -57,14 +65,14 @@ export class BootstrapCoordinator {
     stage: "events" | "markets" | "outcomes",
     processedCount: number
   ): Promise<void> {
-    const barrierKey = `bootstrap:barrier:${stage}`;
+    const barrierKey = this.stageKey(stage);
     const barrierData: QueueBarrier = {
       stage,
       timestamp: Date.now(),
       expectedCount: processedCount
     };
 
-    await redis.setex(barrierKey, this.BARRIER_TTL, JSON.stringify(barrierData));
+    await redis.set(barrierKey, JSON.stringify(barrierData));
 
     logger.info(`[bootstrap-coordinator] set ${stage} barrier`, {
       processedCount,
@@ -72,8 +80,13 @@ export class BootstrapCoordinator {
     });
   }
 
+  static async clearStage(stage: "events" | "markets" | "outcomes"): Promise<void> {
+    const barrierKey = this.stageKey(stage);
+    await redis.del(barrierKey);
+  }
+
   static async isStageComplete(stage: "events" | "markets" | "outcomes"): Promise<boolean> {
-    const barrierKey = `bootstrap:barrier:${stage}`;
+    const barrierKey = this.stageKey(stage);
     const barrier = await redis.get(barrierKey);
     return barrier !== null;
   }

@@ -15,11 +15,13 @@ module.exports = {
       }
     },
     {
-      name: "db-writer-1",
+      name: "db-writer-v2",
       script: "dist/workers/db-writer-standalone-v2.js",
       instances: 1,
-      autorestart: false,
-      max_restarts: 0,
+      autorestart: true,
+      max_restarts: 5,
+      restart_delay: 2000,
+      min_uptime: "10s",
       watch: false,
       max_memory_restart: "300M",
       env: {
