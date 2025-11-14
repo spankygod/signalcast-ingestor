@@ -17,7 +17,7 @@ import { WORKERS } from "../utils/constants";
 
 // Debug configuration
 const DEBUG_SQL_QUERIES = process.env.DEBUG_SQL_QUERIES === 'true';
-const DEBUG_QUERY_TIMEOUT = Number(process.env.DEBUG_QUERY_TIMEOUT || 30000); // 30 seconds
+const DEBUG_QUERY_TIMEOUT = Number(process.env.DEBUG_QUERY_TIMEOUT || 180000); // default 3 minutes
 const DEBUG_DETAILED_TIMING = process.env.DEBUG_DETAILED_TIMING === 'true';
 
 type PipelineStage = {
@@ -160,22 +160,22 @@ export class DbWriterWorker {
       const pipeline: PipelineStage[] = [
         {
           kind: "event",
-          batchSize: 15, // on Pro you can try 15 later
+          batchSize: 5,
           handler: (jobs) => this.processEventJobs(jobs as UpdateJob<NormalizedEvent>[])
         },
         {
           kind: "market",
-          batchSize: 25,
+          batchSize: 5,
           handler: (jobs) => this.processMarketJobsBatch(jobs as UpdateJob<NormalizedMarket>[])
         },
         {
           kind: "outcome",
-          batchSize: 50,
+          batchSize: 10,
           handler: (jobs) => this.processOutcomeJobsBatch(jobs as UpdateJob<NormalizedOutcome>[])
         },
         {
           kind: "tick",
-          batchSize: 100,
+          batchSize: 25,
           handler: (jobs) => this.processTickJobsBatch(jobs as UpdateJob<NormalizedTick>[])
         }
       ];
@@ -800,7 +800,7 @@ export class DbWriterWorker {
     job: UpdateJob<NormalizedMarket>
   ): Promise<boolean> {
     const fetched = await this.fetchAndEnqueueEvent(market.event_polymarket_id);
-    const requeued = await this.requeueJob("market", job);
+    const requeued = fetched ? await this.requeueJob("market", job) : false;
 
     if (requeued) {
       logger.debug("db-writer requeued market awaiting parent event", {
@@ -826,7 +826,7 @@ export class DbWriterWorker {
     const fetched = await this.fetchAndEnqueueMarket(
       outcome.market_polymarket_id
     );
-    const requeued = await this.requeueJob("outcome", job);
+    const requeued = fetched ? await this.requeueJob("outcome", job) : false;
 
     if (requeued) {
       logger.debug("db-writer requeued outcome awaiting parent market", {
