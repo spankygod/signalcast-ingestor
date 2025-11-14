@@ -12,8 +12,10 @@ export class EventsPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
 
-  private async slowBootstrapSleep() {
-    return new Promise(res => setTimeout(res, 1000)); // 1s
+  private async pageThrottle(eventsDone: boolean) {
+    const targetPerSecond = eventsDone ? 7 : 5;
+    const delayMs = Math.round(1000 / targetPerSecond);
+    return new Promise(res => setTimeout(res, delayMs));
   }
 
   start(): void {
@@ -73,10 +75,8 @@ export class EventsPoller {
           break;
         }
 
-        // Throttle during bootstrap
-        if (!eventsDone) {
-          await this.slowBootstrapSleep();
-        }
+        // Rate limit requests (faster after bootstrap)
+        await this.pageThrottle(eventsDone);
       }
 
       // Set bootstrap flag when complete

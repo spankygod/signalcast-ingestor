@@ -80,6 +80,12 @@ export class MarketsPoller {
     return new Promise(res => setTimeout(res, 1000)); // 1s
   }
 
+  private async pageThrottle(marketsDone: boolean) {
+    const targetPerSecond = marketsDone ? 7 : 5;
+    const delayMs = Math.round(1000 / targetPerSecond);
+    return new Promise(res => setTimeout(res, delayMs));
+  }
+
   start(): void {
     if (this.timer) return;
 
@@ -129,12 +135,13 @@ export class MarketsPoller {
       await this.slowBootstrapSleep();
       return;
     }
+    const marketsDone = await bootstrap.isDone("markets_done");
 
     this.isRunning = true;
     heartbeatMonitor.beat(WORKERS.marketsPoller, { state: 'running' });
 
     let offset = 0;
-    const limit = eventsDone ? 100 : 25; // small pages before bootstrap complete
+    const limit = marketsDone ? 100 : 25;
     let fetched = 0;
     let politicsFiltered = 0;
     let queuedUpdates = 0;
@@ -186,14 +193,11 @@ export class MarketsPoller {
 
         if (markets.length < limit) break;
 
-        // Throttle during bootstrap
-        if (!eventsDone) {
-          await this.slowBootstrapSleep();
-        }
+        await this.pageThrottle(marketsDone);
       }
 
       // Set bootstrap flag when complete
-      if (!eventsDone) {
+      if (!marketsDone) {
         await bootstrap.setDone("markets_done");
         logger.info("[bootstrap] markets initial load complete");
       }

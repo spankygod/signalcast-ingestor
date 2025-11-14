@@ -15,6 +15,11 @@ export class OutcomesPoller {
     return new Promise(res => setTimeout(res, 1000)); // 1s
   }
 
+  private async pageThrottle() {
+    const delayMs = Math.round(1000 / 7);
+    return new Promise(res => setTimeout(res, delayMs));
+  }
+
   start(): void {
     if (this.timer) return;
 
@@ -86,6 +91,8 @@ export class OutcomesPoller {
         if (markets.length < limit || fetched > 1000) {
           break;
         }
+
+        await this.pageThrottle();
       }
 
       logger.info(`[outcomes-poller] run finished fetched=${fetched} offset=${offset}`);
