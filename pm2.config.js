@@ -7,7 +7,8 @@ module.exports = {
   apps: [{
     name: 'signalcast-ingestor',
     script: 'src/index.ts',
-    interpreter: 'ts-node',
+    interpreter: 'node',
+    interpreter_args: '--require ts-node/register',
     instances: 1,
     exec_mode: 'fork',
     autorestart: true,
