@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { eq, sql, inArray } from "drizzle-orm";
 import logger, { formatError } from "../lib/logger";
 import { settings } from "../config/settings";
 import { polymarketClient } from "../config/polymarket";
@@ -12,7 +12,6 @@ import {
   normalizeMarket
 } from "../utils/normalizeMarket";
 import { NormalizedTick } from "../utils/normalizeTick";
-import { sleep } from "../lib/retry";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
 
@@ -29,7 +28,7 @@ export class DbWriterWorker {
 
   start(): void {
     if (this.timer) return;
-    logger.info('db-writer starting');
+    logger.info("db-writer starting");
     this.timer = setInterval(() => {
       void this.drain();
     }, settings.queueDrainIntervalMs);
@@ -43,60 +42,48 @@ export class DbWriterWorker {
   }
 
   private async drain(): Promise<void> {
-    heartbeatMonitor.beat(WORKERS.dbWriter, { state: 'alive' });
     if (this.draining) return;
     this.draining = true;
-    heartbeatMonitor.beat(WORKERS.dbWriter, { state: 'draining' });
+
+    // keep-alive heartbeat even if queues are empty
+    heartbeatMonitor.beat(WORKERS.dbWriter, { state: "draining" });
 
     try {
       let totalProcessed = 0;
       const pipeline: PipelineStage[] = [
         {
-          kind: 'event',
-          batchSize: Math.max(1, settings.eventBatchSize),
+          kind: "event",
+          batchSize: 15, // on Pro you can try 15 later
           handler: (jobs) => this.processEventJobs(jobs as UpdateJob<NormalizedEvent>[])
         },
         {
-          kind: 'market',
+          kind: "market",
+          batchSize: 25,
+          handler: (jobs) => this.processMarketJobsBatch(jobs as UpdateJob<NormalizedMarket>[])
+        },
+        {
+          kind: "outcome",
           batchSize: 50,
-          handler: (jobs) => this.processMarketJobs(jobs as UpdateJob<NormalizedMarket>[])
+          handler: (jobs) => this.processOutcomeJobsBatch(jobs as UpdateJob<NormalizedOutcome>[])
         },
         {
-          kind: 'outcome',
+          kind: "tick",
           batchSize: 100,
-          handler: (jobs) => this.processOutcomeJobs(jobs as UpdateJob<NormalizedOutcome>[])
-        },
-        {
-          kind: 'tick',
-          batchSize: 1,
-          handler: (jobs) => this.processTickJobs(jobs as UpdateJob<NormalizedTick>[])
+          handler: (jobs) => this.processTickJobsBatch(jobs as UpdateJob<NormalizedTick>[])
         }
       ];
 
       for (const stage of pipeline) {
-        try {
-          totalProcessed += await this.processQueue(stage);
-        } catch (error) {
-          if (this.isConstraintViolationError(error)) {
-            logger.error('db-writer constraint violation in pipeline stage', {
-              stage: stage.kind,
-              batchSize: stage.batchSize,
-              error: formatError(error)
-            });
-            // For constraint violations, we want to stop processing this stage
-            // to avoid repeated failures, but continue with other stages
-            continue;
-          }
-          // For other errors, re-throw to be caught by the outer try-catch
-          throw error;
-        }
+        totalProcessed += await this.processQueue(stage);
       }
 
       if (totalProcessed === 0) {
+        // beat + mark idle so heartbeat monitor never thinks we're dead
+        heartbeatMonitor.beat(WORKERS.dbWriter, { state: "idle" });
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
-      logger.error('db-writer failed to drain queues', { error: formatError(error) });
+      logger.error("db-writer failed to drain queues", { error: formatError(error) });
     } finally {
       this.draining = false;
     }
@@ -109,26 +96,13 @@ export class DbWriterWorker {
       const jobs = await this.pullJobs(stage.kind, stage.batchSize);
       if (jobs.length === 0) break;
 
-      try {
-        const handled = await stage.handler(jobs);
-        if (handled > 0) {
-          processed += handled;
-          heartbeatMonitor.beat(WORKERS.dbWriter, { kind: stage.kind, processed });
-        }
-      } catch (error) {
-        if (this.isConstraintViolationError(error)) {
-          logger.error('db-writer constraint violation in batch processing', {
-            kind: stage.kind,
-            batchSize: jobs.length,
-            error: formatError(error)
-          });
-          // For constraint violations, we want to fail this batch entirely
-          // The jobs will be lost, but this prevents infinite loops
-          // In the future, we could implement a dead-letter queue here
-          continue;
-        }
-        // For other errors, re-throw to be handled by the caller
-        throw error;
+      const handled = await stage.handler(jobs);
+      if (handled > 0) {
+        processed += handled;
+        heartbeatMonitor.beat(WORKERS.dbWriter, {
+          kind: stage.kind,
+          processed
+        });
       }
     }
 
@@ -145,237 +119,28 @@ export class DbWriterWorker {
     return jobs;
   }
 
+  // ---------------------------
+  // EVENTS (bulk upsert)
+  // ---------------------------
+
   private async processEventJobs(jobs: UpdateJob<NormalizedEvent>[]): Promise<number> {
     if (jobs.length === 0) return 0;
-    await this.upsertEvents(jobs.map(job => job.payload));
+    await this.upsertEvents(jobs.map((job) => job.payload));
     return jobs.length;
-  }
-
-  private async processMarketJobs(jobs: UpdateJob<NormalizedMarket>[]): Promise<number> {
-    if (jobs.length === 0) return 0;
-
-    // Separate jobs by dependency resolution
-    const resolvedMarkets: Array<{ market: NormalizedMarket; eventId: string; job: UpdateJob<NormalizedMarket> }> = [];
-    let processed = 0;
-
-    // First pass: resolve event IDs and separate failed resolutions
-    for (const job of jobs) {
-      const market = job.payload;
-      const eventId = await this.resolveEventId(market.event_polymarket_id);
-      if (eventId) {
-        resolvedMarkets.push({ market, eventId, job });
-      } else {
-        if (await this.handleMissingEventForMarket(market, job)) {
-          processed += 1;
-        }
-      }
-    }
-
-    // Deduplicate resolved markets
-    const deduped = new Map<string, { market: NormalizedMarket; eventId: string; jobs: UpdateJob<NormalizedMarket>[] }>();
-    for (const { market, eventId, job } of resolvedMarkets) {
-      const existing = deduped.get(market.polymarket_id);
-      if (existing) {
-        existing.jobs.push(job);
-      } else {
-        deduped.set(market.polymarket_id, { market, eventId, jobs: [job] });
-      }
-    }
-
-    if (deduped.size !== resolvedMarkets.length) {
-      const duplicateCount = resolvedMarkets.length - deduped.size;
-      logger.info('db-writer deduped market batch before upsert', {
-        original: resolvedMarkets.length,
-        unique: deduped.size,
-        duplicates: duplicateCount,
-        duplicateRate: `${((duplicateCount / resolvedMarkets.length) * 100).toFixed(2)}%`
-      });
-
-      // Log the specific polymarket IDs that were duplicated for debugging
-      const duplicateIds: string[] = [];
-      const seenIds = new Set<string>();
-      for (const { market } of resolvedMarkets) {
-        if (seenIds.has(market.polymarket_id)) {
-          duplicateIds.push(market.polymarket_id);
-        } else {
-          seenIds.add(market.polymarket_id);
-        }
-      }
-
-      if (duplicateIds.length > 0) {
-        logger.debug('db-writer duplicate market polymarket IDs detected', {
-          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
-          totalDuplicates: duplicateIds.length
-        });
-      }
-    }
-
-    // Batch upsert deduplicated markets
-    if (deduped.size > 0) {
-      await this.upsertMarkets(Array.from(deduped.values()));
-      processed += resolvedMarkets.length; // Count all original jobs as processed
-    }
-
-    return processed;
-  }
-
-  private async processMarketJob(job: UpdateJob<NormalizedMarket>): Promise<boolean> {
-    const market = job.payload;
-    const eventId = await this.resolveEventId(market.event_polymarket_id);
-    if (!eventId) {
-      return await this.handleMissingEventForMarket(market, job);
-    }
-
-    await this.upsertMarket(market, eventId);
-    return true;
-  }
-
-  private async processOutcomeJobs(jobs: UpdateJob<NormalizedOutcome>[]): Promise<number> {
-    if (jobs.length === 0) return 0;
-
-    // Separate jobs by dependency resolution
-    const resolvedOutcomes: Array<{ outcome: NormalizedOutcome; marketId: string; job: UpdateJob<NormalizedOutcome> }> = [];
-    let processed = 0;
-
-    // First pass: resolve market IDs and separate failed resolutions
-    for (const job of jobs) {
-      const outcome = job.payload;
-      const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
-      if (marketId) {
-        resolvedOutcomes.push({ outcome, marketId, job });
-      } else {
-        if (await this.handleMissingMarketForOutcome(outcome, job)) {
-          processed += 1;
-        }
-      }
-    }
-
-    // Deduplicate resolved outcomes
-    const deduped = new Map<string, { outcome: NormalizedOutcome; marketId: string; jobs: UpdateJob<NormalizedOutcome>[] }>();
-    for (const { outcome, marketId, job } of resolvedOutcomes) {
-      const existing = deduped.get(outcome.polymarket_id);
-      if (existing) {
-        existing.jobs.push(job);
-      } else {
-        deduped.set(outcome.polymarket_id, { outcome, marketId, jobs: [job] });
-      }
-    }
-
-    if (deduped.size !== resolvedOutcomes.length) {
-      const duplicateCount = resolvedOutcomes.length - deduped.size;
-      logger.info('db-writer deduped outcome batch before upsert', {
-        original: resolvedOutcomes.length,
-        unique: deduped.size,
-        duplicates: duplicateCount,
-        duplicateRate: `${((duplicateCount / resolvedOutcomes.length) * 100).toFixed(2)}%`
-      });
-
-      // Log the specific polymarket IDs that were duplicated for debugging
-      const duplicateIds: string[] = [];
-      const seenIds = new Set<string>();
-      for (const { outcome } of resolvedOutcomes) {
-        if (seenIds.has(outcome.polymarket_id)) {
-          duplicateIds.push(outcome.polymarket_id);
-        } else {
-          seenIds.add(outcome.polymarket_id);
-        }
-      }
-
-      if (duplicateIds.length > 0) {
-        logger.debug('db-writer duplicate outcome polymarket IDs detected', {
-          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
-          totalDuplicates: duplicateIds.length
-        });
-      }
-    }
-
-    // Batch upsert deduplicated outcomes
-    if (deduped.size > 0) {
-      await this.upsertOutcomes(Array.from(deduped.values()));
-      processed += resolvedOutcomes.length; // Count all original jobs as processed
-    }
-
-    return processed;
-  }
-
-  private async processOutcomeJob(job: UpdateJob<NormalizedOutcome>): Promise<boolean> {
-    const outcome = job.payload;
-    const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
-    if (!marketId) {
-      return await this.handleMissingMarketForOutcome(outcome, job);
-    }
-
-    await this.upsertOutcome(outcome, marketId);
-    return true;
-  }
-
-  private async processTickJobs(jobs: UpdateJob<NormalizedTick>[]): Promise<number> {
-    let processed = 0;
-    for (const job of jobs) {
-      if (await this.processTickJob(job)) {
-        processed += 1;
-      }
-    }
-    return processed;
-  }
-
-  private async processTickJob(job: UpdateJob<NormalizedTick>): Promise<boolean> {
-    const tick = job.payload;
-    const marketId = await this.resolveMarketId(tick.market_polymarket_id);
-    if (!marketId) {
-      return await this.handleMissingMarketForTick(tick, job);
-    }
-
-    await this.insertTick(tick, marketId);
-    return true;
   }
 
   private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
     if (batch.length === 0) return;
-    const deduped = new Map<string, NormalizedEvent>();
-    for (const event of batch) {
-      deduped.set(event.polymarket_id, event);
-    }
-
-    if (deduped.size !== batch.length) {
-      const duplicateCount = batch.length - deduped.size;
-      logger.info('db-writer deduped event batch before upsert', {
-        original: batch.length,
-        unique: deduped.size,
-        duplicates: duplicateCount,
-        duplicateRate: `${((duplicateCount / batch.length) * 100).toFixed(2)}%`
-      });
-
-      // Log the specific polymarket IDs that were duplicated for debugging
-      const duplicateIds: string[] = [];
-      const seenIds = new Set<string>();
-      for (const event of batch) {
-        if (seenIds.has(event.polymarket_id)) {
-          duplicateIds.push(event.polymarket_id);
-        } else {
-          seenIds.add(event.polymarket_id);
-        }
-      }
-
-      if (duplicateIds.length > 0) {
-        logger.debug('db-writer duplicate event polymarket IDs detected', {
-          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
-          totalDuplicates: duplicateIds.length
-        });
-      }
-    }
-
-    const uniqueEvents = Array.from(deduped.values());
     const now = new Date();
-    const values = uniqueEvents.map((event) => ({
+    const values = batch.map((event) => ({
       polymarketId: event.polymarket_id,
       title: event.title,
       slug: event.slug,
       description: event.description,
       category: event.category,
-      liquidity: this.decimal(event.liquidity) ?? '0',
-      volume24h: this.decimal(event.volume) ?? '0',
-      volumeTotal: this.decimal(event.volume) ?? '0',
+      liquidity: this.decimal(event.liquidity) ?? "0",
+      volume24h: this.decimal(event.volume) ?? "0",
+      volumeTotal: this.decimal(event.volume) ?? "0",
       active: event.is_active,
       closed: event.closed,
       archived: event.archived,
@@ -386,51 +151,110 @@ export class DbWriterWorker {
       updatedAt: now
     }));
 
-    await this.withConstraintHandling(
-      () =>
-        this.withRateLimitHandling(
-          () =>
-            db.insert(events)
-              .values(values)
-              .onConflictDoUpdate({
-                target: events.polymarketId,
-                set: {
-                  title: sql`excluded.title`,
-                  slug: sql`excluded.slug`,
-                  description: sql`excluded.description`,
-                  category: sql`excluded.category`,
-                  liquidity: sql`excluded.liquidity`,
-                  volume24h: sql`excluded.volume_24h`,
-                  volumeTotal: sql`excluded.volume_total`,
-                  active: sql`excluded.active`,
-                  closed: sql`excluded.closed`,
-                  archived: sql`excluded.archived`,
-                  restricted: sql`excluded.restricted`,
-                  startDate: sql`excluded.start_date`,
-                  endDate: sql`excluded.end_date`,
-                  lastIngestedAt: sql`excluded.last_ingested_at`,
-                  updatedAt: sql`excluded.updated_at`
-                }
-              }),
-          'events-upsert'
-        ),
-      'events-upsert'
-    );
+    await db
+      .insert(events)
+      .values(values)
+      .onConflictDoUpdate({
+        target: events.polymarketId,
+        set: {
+          title: sql`excluded.title`,
+          slug: sql`excluded.slug`,
+          description: sql`excluded.description`,
+          category: sql`excluded.category`,
+          liquidity: sql`excluded.liquidity`,
+          volume24h: sql`excluded.volume_24h`,
+          volumeTotal: sql`excluded.volume_total`,
+          active: sql`excluded.active`,
+          closed: sql`excluded.closed`,
+          archived: sql`excluded.archived`,
+          restricted: sql`excluded.restricted`,
+          startDate: sql`excluded.start_date`,
+          endDate: sql`excluded.end_date`,
+          lastIngestedAt: sql`excluded.last_ingested_at`,
+          updatedAt: sql`excluded.updated_at`
+        }
+      });
   }
 
-  private async upsertMarkets(batch: Array<{ market: NormalizedMarket; eventId: string; jobs: UpdateJob<NormalizedMarket>[] }>): Promise<void> {
-    if (batch.length === 0) return;
+  // ---------------------------
+  // MARKETS (bulk: FK resolve + upsert)
+  // ---------------------------
 
+  private async processMarketJobsBatch(
+    jobs: UpdateJob<NormalizedMarket>[]
+  ): Promise<number> {
+    if (jobs.length === 0) return 0;
+
+    const marketsPayload = jobs.map((j) => j.payload);
+    const eventPolymarketIds = Array.from(
+      new Set(
+        marketsPayload
+          .map((m) => m.event_polymarket_id)
+          .filter((v): v is string => typeof v === "string" && v.length > 0)
+      )
+    );
+
+    if (eventPolymarketIds.length === 0) {
+      logger.warn("db-writer markets batch missing event ids");
+      return 0;
+    }
+
+    const eventRows = await db
+      .select({ polymarketId: events.polymarketId, id: events.id })
+      .from(events)
+      .where(inArray(events.polymarketId, eventPolymarketIds));
+
+    const eventIdByPolymarket = new Map<string, string>();
+    for (const row of eventRows) {
+      eventIdByPolymarket.set(row.polymarketId, row.id);
+    }
+
+    const ready: { market: NormalizedMarket; eventId: string }[] = [];
+    const deferred: UpdateJob<NormalizedMarket>[] = [];
+
+    for (const job of jobs) {
+      const m = job.payload;
+      const eventId = m.event_polymarket_id
+        ? eventIdByPolymarket.get(m.event_polymarket_id)
+        : undefined;
+
+      if (!eventId) {
+        deferred.push(job);
+      } else {
+        ready.push({ market: m, eventId });
+      }
+    }
+
+    if (ready.length > 0) {
+      await this.upsertMarketsBatch(ready);
+    }
+
+    // handle missing parents similar to before, but in batch
+    for (const job of deferred) {
+      const handled = await this.handleMissingEventForMarket(job.payload, job);
+      if (!handled) {
+        // if not handled, we just drop; logs already emitted
+      }
+    }
+
+    return ready.length;
+  }
+
+  private async upsertMarketsBatch(
+    batch: { market: NormalizedMarket; eventId: string }[]
+  ): Promise<void> {
+    if (batch.length === 0) return;
     const now = new Date();
+
     const values = batch.map(({ market, eventId }) => ({
       polymarketId: market.polymarket_id,
       eventId,
       question: market.question,
       slug: market.slug,
       description: market.description,
-      liquidity: this.decimal(market.liquidity) ?? '0',
-      volume24h: this.decimal(market.volume) ?? '0',
-      volumeTotal: this.decimal(market.volume) ?? '0',
+      liquidity: this.decimal(market.liquidity) ?? "0",
+      volume24h: this.decimal(market.volume) ?? "0",
+      volumeTotal: this.decimal(market.volume) ?? "0",
       currentPrice: this.decimal(market.current_price),
       lastTradePrice: this.decimal(market.last_trade_price),
       bestBid: this.decimal(market.best_bid),
@@ -447,181 +271,212 @@ export class DbWriterWorker {
       updatedAt: now
     }));
 
-    await this.withConstraintHandling(
-      () =>
-        this.withRateLimitHandling(
-          () =>
-            db.insert(markets)
-              .values(values)
-              .onConflictDoUpdate({
-                target: markets.polymarketId,
-                set: {
-                  question: sql`excluded.question`,
-                  slug: sql`excluded.slug`,
-                  description: sql`excluded.description`,
-                  liquidity: sql`excluded.liquidity`,
-                  volume24h: sql`excluded.volume_24h`,
-                  volumeTotal: sql`excluded.volume_total`,
-                  currentPrice: sql`excluded.current_price`,
-                  lastTradePrice: sql`excluded.last_trade_price`,
-                  bestBid: sql`excluded.best_bid`,
-                  bestAsk: sql`excluded.best_ask`,
-                  status: sql`excluded.status`,
-                  resolvedAt: sql`excluded.resolved_at`,
-                  active: sql`excluded.active`,
-                  closed: sql`excluded.closed`,
-                  archived: sql`excluded.archived`,
-                  restricted: sql`excluded.restricted`,
-                  approved: sql`excluded.approved`,
-                  relevanceScore: sql`excluded.relevance_score`,
-                  lastIngestedAt: sql`excluded.last_ingested_at`,
-                  updatedAt: sql`excluded.updated_at`
-                }
-              }),
-          'markets-upsert'
-        ),
-      'markets-upsert'
-    );
+    await db
+      .insert(markets)
+      .values(values)
+      .onConflictDoUpdate({
+        target: markets.polymarketId,
+        set: {
+          ...values[0], // shape only; drizzle ignores values beyond type
+          updatedAt: new Date(),
+          lastIngestedAt: new Date()
+        }
+      });
   }
 
-  private async upsertOutcomes(batch: Array<{ outcome: NormalizedOutcome; marketId: string; jobs: UpdateJob<NormalizedOutcome>[] }>): Promise<void> {
+  // ---------------------------
+  // OUTCOMES (bulk)
+  // ---------------------------
+
+  private async processOutcomeJobsBatch(
+    jobs: UpdateJob<NormalizedOutcome>[]
+  ): Promise<number> {
+    if (jobs.length === 0) return 0;
+
+    const payloads = jobs.map((j) => j.payload);
+    const marketPolymarketIds = Array.from(
+      new Set(
+        payloads
+          .map((o) => o.market_polymarket_id)
+          .filter((v): v is string => typeof v === "string" && v.length > 0)
+      )
+    );
+
+    if (marketPolymarketIds.length === 0) {
+      logger.warn("db-writer outcomes batch missing market ids");
+      return 0;
+    }
+
+    const marketRows = await db
+      .select({ polymarketId: markets.polymarketId, id: markets.id })
+      .from(markets)
+      .where(inArray(markets.polymarketId, marketPolymarketIds));
+
+    const marketIdByPolymarket = new Map<string, string>();
+    for (const row of marketRows) {
+      if (row.id && row.polymarketId) {
+        marketIdByPolymarket.set(row.polymarketId, row.id);
+      }
+    }
+
+    const ready: { outcome: NormalizedOutcome; marketId: string }[] = [];
+    const deferred: UpdateJob<NormalizedOutcome>[] = [];
+
+    for (const job of jobs) {
+      const o = job.payload;
+      const marketId = o.market_polymarket_id
+        ? marketIdByPolymarket.get(o.market_polymarket_id)
+        : undefined;
+
+      if (!marketId) {
+        deferred.push(job);
+      } else {
+        ready.push({ outcome: o, marketId });
+      }
+    }
+
+    if (ready.length > 0) {
+      await this.upsertOutcomesBatch(ready);
+    }
+
+    for (const job of deferred) {
+      const handled = await this.handleMissingMarketForOutcome(job.payload, job);
+      if (!handled) {
+        // dropped; already logged
+      }
+    }
+
+    return ready.length;
+  }
+
+  private async upsertOutcomesBatch(
+    batch: { outcome: NormalizedOutcome; marketId: string }[]
+  ): Promise<void> {
     if (batch.length === 0) return;
+    const now = new Date();
 
     const values = batch.map(({ outcome, marketId }) => ({
       polymarketId: outcome.polymarket_id,
       marketId,
       title: outcome.title,
       description: outcome.description,
-      price: this.decimal(outcome.price) ?? '0',
-      probability: this.decimal(outcome.probability) ?? '0',
-      volume: this.decimal(outcome.volume) ?? '0',
+      price: this.decimal(outcome.price) ?? "0",
+      probability: this.decimal(outcome.probability) ?? "0",
+      volume: this.decimal(outcome.volume) ?? "0",
       status: outcome.status,
       displayOrder: outcome.display_order,
-      updatedAt: new Date()
+      updatedAt: now
     }));
 
-    await this.withConstraintHandling(
-      () =>
-        this.withRateLimitHandling(
-          () =>
-            db.insert(outcomes)
-              .values(values)
-              .onConflictDoUpdate({
-                target: outcomes.polymarketId,
-                set: {
-                  title: sql`excluded.title`,
-                  description: sql`excluded.description`,
-                  price: sql`excluded.price`,
-                  probability: sql`excluded.probability`,
-                  volume: sql`excluded.volume`,
-                  status: sql`excluded.status`,
-                  displayOrder: sql`excluded.display_order`,
-                  updatedAt: sql`excluded.updated_at`
-                }
-              }),
-          'outcomes-upsert'
-        ),
-      'outcomes-upsert'
-    );
+    await db
+      .insert(outcomes)
+      .values(values)
+      .onConflictDoUpdate({
+        target: outcomes.polymarketId,
+        set: {
+          ...values[0],
+          updatedAt: new Date()
+        }
+      });
   }
 
-  private async upsertMarket(market: NormalizedMarket, eventId: string): Promise<void> {
-    const values = {
-      polymarketId: market.polymarket_id,
-      eventId,
-      question: market.question,
-      slug: market.slug,
-      description: market.description,
-      liquidity: this.decimal(market.liquidity) ?? '0',
-      volume24h: this.decimal(market.volume) ?? '0',
-      volumeTotal: this.decimal(market.volume) ?? '0',
-      currentPrice: this.decimal(market.current_price),
-      lastTradePrice: this.decimal(market.last_trade_price),
-      bestBid: this.decimal(market.best_bid),
-      bestAsk: this.decimal(market.best_ask),
-      status: market.status,
-      resolvedAt: this.toDate(market.resolved_at),
-      active: market.is_active,
-      closed: market.closed,
-      archived: market.archived,
-      restricted: market.restricted,
-      approved: market.approved,
-      relevanceScore: market.relevance_score,
-      lastIngestedAt: new Date(),
-      updatedAt: new Date()
-    };
+  // ---------------------------
+  // TICKS (bulk insert)
+  // ---------------------------
 
-    await this.withRateLimitHandling(
-      () =>
-        db.insert(markets)
-        .values(values)
-        .onConflictDoUpdate({
-          target: markets.polymarketId,
-          set: {
-            ...values,
-            updatedAt: new Date(),
-            lastIngestedAt: new Date()
-          }
-        }),
-      'markets-upsert'
+  private async processTickJobsBatch(
+    jobs: UpdateJob<NormalizedTick>[]
+  ): Promise<number> {
+    if (jobs.length === 0) return 0;
+
+    const payloads = jobs.map((j) => j.payload);
+    const marketPolymarketIds = Array.from(
+      new Set(
+        payloads
+          .map((t) => t.market_polymarket_id)
+          .filter((v): v is string => typeof v === "string" && v.length > 0)
+      )
     );
+
+    if (marketPolymarketIds.length === 0) {
+      logger.warn("db-writer ticks batch missing market ids");
+      return 0;
+    }
+
+    const marketRows = await db
+      .select({ polymarketId: markets.polymarketId, id: markets.id })
+      .from(markets)
+      .where(inArray(markets.polymarketId, marketPolymarketIds));
+
+    const marketIdByPolymarket = new Map<string, string>();
+    for (const row of marketRows) {
+      if (row.id && row.polymarketId) {
+        marketIdByPolymarket.set(row.polymarketId, row.id);
+      }
+    }
+
+    const ready: { tick: NormalizedTick; marketId: string }[] = [];
+    const deferred: UpdateJob<NormalizedTick>[] = [];
+
+    for (const job of jobs) {
+      const t = job.payload;
+      const marketId = t.market_polymarket_id
+        ? marketIdByPolymarket.get(t.market_polymarket_id)
+        : undefined;
+
+      if (!marketId) {
+        deferred.push(job);
+      } else {
+        ready.push({ tick: t, marketId });
+      }
+    }
+
+    if (ready.length > 0) {
+      await this.insertTicksBatch(ready);
+    }
+
+    for (const job of deferred) {
+      const handled = await this.handleMissingMarketForTick(job.payload, job);
+      if (!handled) {
+        // dropped; already logged
+      }
+    }
+
+    return ready.length;
   }
 
-  private async upsertOutcome(outcome: NormalizedOutcome, marketId: string): Promise<void> {
-    const values = {
-      polymarketId: outcome.polymarket_id,
+  private async insertTicksBatch(
+    batch: { tick: NormalizedTick; marketId: string }[]
+  ): Promise<void> {
+    if (batch.length === 0) return;
+
+    const values = batch.map(({ tick, marketId }) => ({
       marketId,
-      title: outcome.title,
-      description: outcome.description,
-      price: this.decimal(outcome.price) ?? '0',
-      probability: this.decimal(outcome.probability) ?? '0',
-      volume: this.decimal(outcome.volume) ?? '0',
-      status: outcome.status,
-      displayOrder: outcome.display_order,
-      updatedAt: new Date()
-    };
+      price: this.decimal(tick.price),
+      bestBid: this.decimal(tick.best_bid),
+      bestAsk: this.decimal(tick.best_ask),
+      lastTradePrice: this.decimal(tick.last_trade_price),
+      liquidity: this.decimal(tick.liquidity),
+      volume24h: this.decimal(tick.volume_24h),
+      updatedAt: this.toDate(tick.captured_at) ?? new Date()
+    }));
 
-    await this.withRateLimitHandling(
-      () =>
-        db.insert(outcomes)
-        .values(values)
-        .onConflictDoUpdate({
-          target: outcomes.polymarketId,
-          set: {
-            ...values,
-            updatedAt: new Date()
-          }
-        }),
-      'outcomes-upsert'
-    );
+    await db.insert(marketPricesRealtime).values(values);
   }
 
-  private async insertTick(tick: NormalizedTick, marketId: string): Promise<void> {
-    await this.withRateLimitHandling(
-      () =>
-        db.insert(marketPricesRealtime).values({
-          marketId,
-          price: this.decimal(tick.price),
-          bestBid: this.decimal(tick.best_bid),
-          bestAsk: this.decimal(tick.best_ask),
-          lastTradePrice: this.decimal(tick.last_trade_price),
-          liquidity: this.decimal(tick.liquidity),
-          volume24h: this.decimal(tick.volume_24h),
-          updatedAt: this.toDate(tick.captured_at) ?? new Date()
-        }),
-      'ticks-insert'
-    );
-  }
+  // ---------------------------
+  // Parent-missing handling (unchanged logic, just reused)
+  // ---------------------------
 
   private async handleMissingEventForMarket(
     market: NormalizedMarket,
     job: UpdateJob<NormalizedMarket>
   ): Promise<boolean> {
     const fetched = await this.fetchAndEnqueueEvent(market.event_polymarket_id);
-    const requeued = await this.requeueJob('market', job);
+    const requeued = await this.requeueJob("market", job);
 
     if (requeued) {
-      logger.debug('db-writer requeued market awaiting parent event', {
+      logger.debug("db-writer requeued market awaiting parent event", {
         polymarketId: market.polymarket_id,
         eventPolymarketId: market.event_polymarket_id,
         fetched
@@ -629,7 +484,7 @@ export class DbWriterWorker {
       return false;
     }
 
-    logger.warn('db-writer dropping market after missing parent event', {
+    logger.warn("db-writer dropping market after missing parent event", {
       polymarketId: market.polymarket_id,
       eventPolymarketId: market.event_polymarket_id,
       fetched
@@ -641,11 +496,13 @@ export class DbWriterWorker {
     outcome: NormalizedOutcome,
     job: UpdateJob<NormalizedOutcome>
   ): Promise<boolean> {
-    const fetched = await this.fetchAndEnqueueMarket(outcome.market_polymarket_id);
-    const requeued = await this.requeueJob('outcome', job);
+    const fetched = await this.fetchAndEnqueueMarket(
+      outcome.market_polymarket_id
+    );
+    const requeued = await this.requeueJob("outcome", job);
 
     if (requeued) {
-      logger.debug('db-writer requeued outcome awaiting parent market', {
+      logger.debug("db-writer requeued outcome awaiting parent market", {
         polymarketId: outcome.polymarket_id,
         marketPolymarketId: outcome.market_polymarket_id,
         fetched
@@ -653,7 +510,7 @@ export class DbWriterWorker {
       return false;
     }
 
-    logger.warn('db-writer dropping outcome after missing parent market', {
+    logger.warn("db-writer dropping outcome after missing parent market", {
       polymarketId: outcome.polymarket_id,
       marketPolymarketId: outcome.market_polymarket_id,
       fetched
@@ -665,24 +522,31 @@ export class DbWriterWorker {
     tick: NormalizedTick,
     job: UpdateJob<NormalizedTick>
   ): Promise<boolean> {
-    const fetched = await this.fetchAndEnqueueMarket(tick.market_polymarket_id);
-    const requeued = fetched ? await this.requeueJob('tick', job) : false;
+    const fetched = await this.fetchAndEnqueueMarket(
+      tick.market_polymarket_id
+    );
+    const requeued = fetched ? await this.requeueJob("tick", job) : false;
 
     if (requeued) {
-      logger.debug('db-writer requeued tick awaiting parent market', {
+      logger.debug("db-writer requeued tick awaiting parent market", {
         marketPolymarketId: tick.market_polymarket_id
       });
       return false;
     }
 
-    logger.debug('db-writer skipping tick for unknown market', { polymarketId: tick.market_polymarket_id });
+    logger.debug("db-writer skipping tick for unknown market", {
+      polymarketId: tick.market_polymarket_id
+    });
     return true;
   }
 
-  private async requeueJob<T>(kind: UpdateKind, job: UpdateJob<T>): Promise<boolean> {
+  private async requeueJob<T>(
+    kind: UpdateKind,
+    job: UpdateJob<T>
+  ): Promise<boolean> {
     const attempts = job.attempts ?? 0;
     if (attempts >= this.maxJobAttempts) {
-      logger.warn('db-writer max attempts exceeded, dropping job', {
+      logger.warn("db-writer max attempts exceeded, dropping job", {
         kind,
         attempts,
         queuedAt: job.queuedAt
@@ -698,14 +562,14 @@ export class DbWriterWorker {
     try {
       const event = await polymarketClient.getEvent(polymarketId);
       if (!event) {
-        logger.warn('db-writer event lookup returned no data', { polymarketId });
+        logger.warn("db-writer event lookup returned no data", { polymarketId });
         return false;
       }
 
-      await pushUpdate('event', normalizeEvent(event));
+      await pushUpdate("event", normalizeEvent(event));
       return true;
     } catch (error) {
-      logger.warn('db-writer failed to fetch event from API', {
+      logger.warn("db-writer failed to fetch event from API", {
         polymarketId,
         error: formatError(error)
       });
@@ -717,43 +581,23 @@ export class DbWriterWorker {
     try {
       const market = await polymarketClient.getMarket(polymarketId);
       if (!market) {
-        logger.warn('db-writer market lookup returned no data', { polymarketId });
+        logger.warn("db-writer market lookup returned no data", { polymarketId });
         return false;
       }
 
       const eventId = market.event?.id ?? market.eventId ?? market.id;
       if (market.event) {
-        await pushUpdate('event', normalizeEvent(market.event));
+        await pushUpdate("event", normalizeEvent(market.event));
       }
-      await pushUpdate('market', normalizeMarket(market, { id: eventId }));
+      await pushUpdate("market", normalizeMarket(market, { id: eventId }));
       return true;
     } catch (error) {
-      logger.warn('db-writer failed to fetch market from API', {
+      logger.warn("db-writer failed to fetch market from API", {
         polymarketId,
         error: formatError(error)
       });
       return false;
     }
-  }
-
-  private async resolveEventId(polymarketId: string): Promise<string | null> {
-    const result = await db
-      .select({ id: events.id })
-      .from(events)
-      .where(eq(events.polymarketId, polymarketId))
-      .limit(1);
-
-    return result[0]?.id ?? null;
-  }
-
-  private async resolveMarketId(polymarketId: string): Promise<string | null> {
-    const result = await db
-      .select({ id: markets.id })
-      .from(markets)
-      .where(eq(markets.polymarketId, polymarketId))
-      .limit(1);
-
-    return result[0]?.id ?? null;
   }
 
   private decimal(value?: number | null): string | null {
@@ -768,57 +612,6 @@ export class DbWriterWorker {
     if (value instanceof Date) return value;
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
-  }
-
-  private async withRateLimitHandling<T>(operation: () => Promise<T>, context: string): Promise<T> {
-    try {
-      return await operation();
-    } catch (error) {
-      if (this.isRateLimitError(error)) {
-        const delay = Number(process.env.DB_RATE_LIMIT_BACKOFF_MS || 500);
-        logger.warn('db-writer rate limit detected, backing off', {
-          context,
-          delay,
-          error: formatError(error)
-        });
-        await sleep(delay);
-      }
-      throw error;
-    }
-  }
-
-  private isRateLimitError(error: unknown): boolean {
-    if (!error) return false;
-    const message = error instanceof Error ? error.message : String(error);
-    return message.toLowerCase().includes('too many concurrent writes');
-  }
-
-  private isConstraintViolationError(error: unknown): boolean {
-    if (!error) return false;
-    const message = error instanceof Error ? error.message : String(error);
-    return message.toLowerCase().includes('on conflict do update') ||
-           message.toLowerCase().includes('duplicate key') ||
-           message.toLowerCase().includes('unique constraint') ||
-           message.toLowerCase().includes('cardinality violation') ||
-           message.includes('21000'); // PostgreSQL cardinality violation error code
-  }
-
-  private async withConstraintHandling<T>(operation: () => Promise<T>, context: string): Promise<T> {
-    try {
-      return await operation();
-    } catch (error) {
-      if (this.isConstraintViolationError(error)) {
-        logger.error('db-writer constraint violation detected', {
-          context,
-          error: formatError(error)
-        });
-
-        // For constraint violations, we want to fail fast and not retry
-        // as retrying the same operation will likely fail again
-        throw new Error(`Constraint violation in ${context}: ${error instanceof Error ? error.message : String(error)}`);
-      }
-      throw error;
-    }
   }
 }
 

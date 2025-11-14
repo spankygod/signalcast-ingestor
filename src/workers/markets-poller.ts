@@ -23,25 +23,21 @@ class LRUCache<K, V> {
     const item = this.cache.get(key);
     if (!item) return undefined;
 
-    // Check if item has expired
     if (Date.now() - item.timestamp > this.ttlMs) {
       this.cache.delete(key);
       return undefined;
     }
 
-    // Move to end (most recently used)
     this.cache.delete(key);
     this.cache.set(key, item);
     return item.value;
   }
 
   set(key: K, value: V): void {
-    // Delete existing if present
     if (this.cache.has(key)) {
       this.cache.delete(key);
     }
 
-    // Remove oldest if at capacity
     if (this.cache.size >= this.maxSize) {
       const firstKey = this.cache.keys().next().value;
       if (firstKey !== undefined) {
@@ -61,7 +57,6 @@ class LRUCache<K, V> {
   }
 
   size(): number {
-    // Clean expired entries before returning size
     const now = Date.now();
     const keysToDelete: K[] = [];
     this.cache.forEach((item, key) => {
@@ -77,9 +72,8 @@ class LRUCache<K, V> {
 export class MarketsPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
-  // Fixed memory leak: Replace unbounded Set with LRU cache
-  // Cache max 10,000 events with 1 hour TTL to prevent memory growth
-  private knownEvents = new LRUCache<string, boolean>(10000, 60 * 60 * 1000); // 10k items, 1 hour TTL
+  // 10k events, 1h TTL – good even for Pro tier
+  private knownEvents = new LRUCache<string, boolean>(10000, 60 * 60 * 1000);
 
   start(): void {
     if (this.timer) return;
@@ -97,12 +91,10 @@ export class MarketsPoller {
       clearInterval(this.timer);
       this.timer = null;
     }
-    // Clean up memory when stopping
     this.cleanup();
   }
 
   private cleanup(): void {
-    // Clear the cache to free memory
     this.knownEvents.clear();
     logger.info('[markets-poller] cleanup completed, cache cleared');
   }
@@ -112,7 +104,6 @@ export class MarketsPoller {
       return;
     }
 
-    // Log cache size periodically for memory monitoring
     const cacheSize = this.knownEvents.size();
     if (cacheSize > 0 && cacheSize % 1000 === 0) {
       logger.info('[markets-poller] memory monitor', {
@@ -122,13 +113,15 @@ export class MarketsPoller {
     }
 
     if (await this.shouldPauseForEventBacklog()) {
+      heartbeatMonitor.markIdle(WORKERS.marketsPoller, { reason: 'event-backlog' });
       return;
     }
 
     this.isRunning = true;
-    heartbeatMonitor.beat(WORKERS.marketsPoller);
+    heartbeatMonitor.beat(WORKERS.marketsPoller, { state: 'running' });
+
     let offset = 0;
-    const limit = 100;
+    const limit = 100; // you can experiment with 200 on Pro
     let fetched = 0;
     let politicsFiltered = 0;
     let queuedUpdates = 0;
@@ -164,8 +157,12 @@ export class MarketsPoller {
         offset += limit;
 
         logger.info(`[markets-poller] | ${fetched}/${offset} | politics=${politicsFiltered} | queued=${queuedUpdates}`);
-
-        heartbeatMonitor.beat(WORKERS.marketsPoller, { fetched, offset, politicsFiltered, queuedUpdates });
+        heartbeatMonitor.beat(WORKERS.marketsPoller, {
+          fetched,
+          offset,
+          politicsFiltered,
+          queuedUpdates
+        });
 
         if (markets.length < limit) break;
       }
@@ -181,7 +178,7 @@ export class MarketsPoller {
       });
     } finally {
       this.isRunning = false;
-      heartbeatMonitor.markIdle(WORKERS.marketsPoller);
+      heartbeatMonitor.markIdle(WORKERS.marketsPoller, { state: 'idle' });
     }
   }
 
@@ -193,7 +190,6 @@ export class MarketsPoller {
           backlog,
           threshold: settings.eventQueueBacklogThreshold
         });
-        heartbeatMonitor.markIdle(WORKERS.marketsPoller, { backlog, reason: 'event-backlog' });
         return true;
       }
     } catch (error) {
