@@ -215,16 +215,16 @@ export class DbWriterWorker {
           description: sql`excluded.description`,
           category: sql`excluded.category`,
           liquidity: sql`excluded.liquidity`,
-          volume24h: sql`excluded.volume24h`,
-          volumeTotal: sql`excluded.volumeTotal`,
+          volume24h: sql`excluded.volume_24h`,
+          volumeTotal: sql`excluded.volume_total`,
           active: sql`excluded.active`,
           closed: sql`excluded.closed`,
           archived: sql`excluded.archived`,
           restricted: sql`excluded.restricted`,
-          startDate: sql`excluded.startDate`,
-          endDate: sql`excluded.endDate`,
-          lastIngestedAt: sql`excluded.lastIngestedAt`,
-          updatedAt: sql`excluded.updatedAt`
+          startDate: sql`excluded.start_date`,
+          endDate: sql`excluded.end_date`,
+          lastIngestedAt: sql`excluded.last_ingested_at`,
+          updatedAt: sql`excluded.updated_at`
         }
       });
   }
@@ -307,27 +307,27 @@ export class DbWriterWorker {
       .onConflictDoUpdate({
         target: markets.polymarketId,
         set: {
-          eventId: sql`excluded.eventId`,
+          eventId: sql`excluded.event_id`,
           question: sql`excluded.question`,
           slug: sql`excluded.slug`,
           description: sql`excluded.description`,
           liquidity: sql`excluded.liquidity`,
-          volume24h: sql`excluded.volume24h`,
-          volumeTotal: sql`excluded.volumeTotal`,
-          currentPrice: sql`excluded.currentPrice`,
-          lastTradePrice: sql`excluded.lastTradePrice`,
-          bestBid: sql`excluded.bestBid`,
-          bestAsk: sql`excluded.bestAsk`,
+          volume24h: sql`excluded.volume_24h`,
+          volumeTotal: sql`excluded.volume_total`,
+          currentPrice: sql`excluded.current_price`,
+          lastTradePrice: sql`excluded.last_trade_price`,
+          bestBid: sql`excluded.best_bid`,
+          bestAsk: sql`excluded.best_ask`,
           status: sql`excluded.status`,
-          resolvedAt: sql`excluded.resolvedAt`,
+          resolvedAt: sql`excluded.resolved_at`,
           active: sql`excluded.active`,
           closed: sql`excluded.closed`,
           archived: sql`excluded.archived`,
           restricted: sql`excluded.restricted`,
           approved: sql`excluded.approved`,
-          relevanceScore: sql`excluded.relevanceScore`,
-          lastIngestedAt: sql`excluded.lastIngestedAt`,
-          updatedAt: sql`excluded.updatedAt`
+          relevanceScore: sql`excluded.relevance_score`,
+          lastIngestedAt: sql`excluded.last_ingested_at`,
+          updatedAt: sql`excluded.updated_at`
         }
       });
   }
@@ -397,8 +397,8 @@ export class DbWriterWorker {
           probability: sql`excluded.probability`,
           volume: sql`excluded.volume`,
           status: sql`excluded.status`,
-          displayOrder: sql`excluded.displayOrder`,
-          updatedAt: sql`excluded.updatedAt`
+          displayOrder: sql`excluded.display_order`,
+          updatedAt: sql`excluded.updated_at`
         }
       });
   }
