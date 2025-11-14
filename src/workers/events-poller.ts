@@ -16,9 +16,9 @@ export class EventsPoller {
   private isRunning = false;
 
   private async pageThrottle(isBootstrap: boolean) {
-    // During bootstrap: ~1 page / second
+    // During bootstrap: ~1 page / 2 seconds (more conservative)
     // After bootstrap: ~2 pages / second
-    const targetPerSecond = isBootstrap ? 1 : 2;
+    const targetPerSecond = isBootstrap ? 0.5 : 2;
     const delayMs = Math.round(1000 / targetPerSecond);
     return new Promise((res) => setTimeout(res, delayMs));
   }
@@ -145,7 +145,7 @@ export class EventsPoller {
         });
 
         if (events.length < limit) {
-          logger.info("[events-poller] last page received (less than full page size)");
+          logger.info("[events-poller] last page received (less than full page size) - events bootstrap complete");
           break;
         }
 

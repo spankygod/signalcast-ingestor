@@ -12,7 +12,7 @@ export class OutcomesPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
   private async slowBootstrapSleep() {
-    return new Promise(res => setTimeout(res, 1000)); // 1s
+    return new Promise(res => setTimeout(res, 3_000)); // 3s - reduce API pressure
   }
 
   private async pageThrottle() {
@@ -44,26 +44,27 @@ export class OutcomesPoller {
       return;
     }
 
+    // Check bootstrap flags BEFORE making any API calls
+    const eventsDone = await bootstrap.isDone("events_done");
+    if (!eventsDone) {
+      logger.info("[bootstrap] outcomes-poller waiting for events_done flag");
+      await this.slowBootstrapSleep();
+      return;
+    }
+
+    const marketsDone = await bootstrap.isDone("markets_done");
+    if (!marketsDone) {
+      logger.info("[bootstrap] outcomes-poller waiting for markets_done flag");
+      await this.slowBootstrapSleep();
+      return;
+    }
+
     this.isRunning = true;
     heartbeatMonitor.beat(WORKERS.outcomesPoller);
     let offset = 0;
     let fetched = 0;
 
     try {
-      const eventsDone = await bootstrap.isDone("events_done");
-      if (!eventsDone) {
-        logger.info("[bootstrap] waiting for events to finish before outcomes");
-        await this.slowBootstrapSleep();
-        return;
-      }
-
-      const marketsDone = await bootstrap.isDone("markets_done");
-      if (!marketsDone) {
-        logger.info("[bootstrap] waiting for markets to finish before outcomes");
-        await this.slowBootstrapSleep();
-        return;
-      }
-
       const limit = 100;
 
       while (true) {

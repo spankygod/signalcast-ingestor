@@ -81,7 +81,7 @@ export class MarketsPoller {
   }
 
   private async slowBootstrapSleep() {
-    return new Promise((res) => setTimeout(res, 1_000)); // 1s
+    return new Promise((res) => setTimeout(res, 3_000)); // 3s - reduce API pressure
   }
 
   private async shouldPauseForBacklog(): Promise<boolean> {
@@ -140,11 +140,11 @@ export class MarketsPoller {
       return;
     }
 
-    // ❗ hard gate – don’t spam markets until events bootstrap is done
+    // ❗ hard gate – don't query markets API until events bootstrap is done
     const eventsDone = await bootstrap.isDone("events_done");
     if (!eventsDone) {
       logger.info(
-        "[markets-poller] waiting for events bootstrap to complete before polling markets",
+        "[markets-poller] waiting for events_done flag before querying markets API",
       );
       await this.slowBootstrapSleep();
       return;
