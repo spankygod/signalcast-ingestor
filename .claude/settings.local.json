@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "mcp__sequential-thinking__sequentialthinking"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

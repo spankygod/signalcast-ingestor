@@ -8,10 +8,76 @@ import { QUEUES, WORKERS } from '../utils/constants';
 import { politicsFilter } from '../utils/politicsFilter';
 import { redis } from '../lib/redis';
 
+// LRU Cache implementation to prevent memory leaks
+class LRUCache<K, V> {
+  private cache = new Map<K, { value: V; timestamp: number }>();
+  private maxSize: number;
+  private ttlMs: number;
+
+  constructor(maxSize: number, ttlMs: number) {
+    this.maxSize = maxSize;
+    this.ttlMs = ttlMs;
+  }
+
+  get(key: K): V | undefined {
+    const item = this.cache.get(key);
+    if (!item) return undefined;
+
+    // Check if item has expired
+    if (Date.now() - item.timestamp > this.ttlMs) {
+      this.cache.delete(key);
+      return undefined;
+    }
+
+    // Move to end (most recently used)
+    this.cache.delete(key);
+    this.cache.set(key, item);
+    return item.value;
+  }
+
+  set(key: K, value: V): void {
+    // Delete existing if present
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    }
+
+    // Remove oldest if at capacity
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+
+    this.cache.set(key, { value, timestamp: Date.now() });
+  }
+
+  has(key: K): boolean {
+    return this.get(key) !== undefined;
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  size(): number {
+    // Clean expired entries before returning size
+    const now = Date.now();
+    const keysToDelete: K[] = [];
+    this.cache.forEach((item, key) => {
+      if (now - item.timestamp > this.ttlMs) {
+        keysToDelete.push(key);
+      }
+    });
+    keysToDelete.forEach(key => this.cache.delete(key));
+    return this.cache.size;
+  }
+}
+
 export class MarketsPoller {
   private timer: NodeJS.Timeout | null = null;
   private isRunning = false;
-  private knownEvents = new Set<string>();
+  // Fixed memory leak: Replace unbounded Set with LRU cache
+  // Cache max 10,000 events with 1 hour TTL to prevent memory growth
+  private knownEvents = new LRUCache<string, boolean>(10000, 60 * 60 * 1000); // 10k items, 1 hour TTL
 
   start(): void {
     if (this.timer) return;
@@ -29,11 +95,28 @@ export class MarketsPoller {
       clearInterval(this.timer);
       this.timer = null;
     }
+    // Clean up memory when stopping
+    this.cleanup();
+  }
+
+  private cleanup(): void {
+    // Clear the cache to free memory
+    this.knownEvents.clear();
+    logger.info('[markets-poller] cleanup completed, cache cleared');
   }
 
   private async poll(): Promise<void> {
     if (this.isRunning) {
       return;
+    }
+
+    // Log cache size periodically for memory monitoring
+    const cacheSize = this.knownEvents.size();
+    if (cacheSize > 0 && cacheSize % 1000 === 0) {
+      logger.info('[markets-poller] memory monitor', {
+        knownEventsCount: cacheSize,
+        cacheMaxSize: 10000
+      });
     }
 
     if (await this.shouldPauseForEventBacklog()) {
@@ -145,7 +228,7 @@ export class MarketsPoller {
     }
 
     await pushUpdate('event', normalizeEvent(eventData));
-    this.knownEvents.add(eventId);
+    this.knownEvents.set(eventId, true);
   }
 }
 

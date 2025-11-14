@@ -74,7 +74,22 @@ export class DbWriterWorker {
       ];
 
       for (const stage of pipeline) {
-        totalProcessed += await this.processQueue(stage);
+        try {
+          totalProcessed += await this.processQueue(stage);
+        } catch (error) {
+          if (this.isConstraintViolationError(error)) {
+            logger.error('db-writer constraint violation in pipeline stage', {
+              stage: stage.kind,
+              batchSize: stage.batchSize,
+              error: formatError(error)
+            });
+            // For constraint violations, we want to stop processing this stage
+            // to avoid repeated failures, but continue with other stages
+            continue;
+          }
+          // For other errors, re-throw to be caught by the outer try-catch
+          throw error;
+        }
       }
 
       if (totalProcessed === 0) {
@@ -94,10 +109,26 @@ export class DbWriterWorker {
       const jobs = await this.pullJobs(stage.kind, stage.batchSize);
       if (jobs.length === 0) break;
 
-      const handled = await stage.handler(jobs);
-      if (handled > 0) {
-        processed += handled;
-        heartbeatMonitor.beat(WORKERS.dbWriter, { kind: stage.kind, processed });
+      try {
+        const handled = await stage.handler(jobs);
+        if (handled > 0) {
+          processed += handled;
+          heartbeatMonitor.beat(WORKERS.dbWriter, { kind: stage.kind, processed });
+        }
+      } catch (error) {
+        if (this.isConstraintViolationError(error)) {
+          logger.error('db-writer constraint violation in batch processing', {
+            kind: stage.kind,
+            batchSize: jobs.length,
+            error: formatError(error)
+          });
+          // For constraint violations, we want to fail this batch entirely
+          // The jobs will be lost, but this prevents infinite loops
+          // In the future, we could implement a dead-letter queue here
+          continue;
+        }
+        // For other errors, re-throw to be handled by the caller
+        throw error;
       }
     }
 
@@ -121,12 +152,70 @@ export class DbWriterWorker {
   }
 
   private async processMarketJobs(jobs: UpdateJob<NormalizedMarket>[]): Promise<number> {
+    if (jobs.length === 0) return 0;
+
+    // Separate jobs by dependency resolution
+    const resolvedMarkets: Array<{ market: NormalizedMarket; eventId: string; job: UpdateJob<NormalizedMarket> }> = [];
     let processed = 0;
+
+    // First pass: resolve event IDs and separate failed resolutions
     for (const job of jobs) {
-      if (await this.processMarketJob(job)) {
-        processed += 1;
+      const market = job.payload;
+      const eventId = await this.resolveEventId(market.event_polymarket_id);
+      if (eventId) {
+        resolvedMarkets.push({ market, eventId, job });
+      } else {
+        if (await this.handleMissingEventForMarket(market, job)) {
+          processed += 1;
+        }
       }
     }
+
+    // Deduplicate resolved markets
+    const deduped = new Map<string, { market: NormalizedMarket; eventId: string; jobs: UpdateJob<NormalizedMarket>[] }>();
+    for (const { market, eventId, job } of resolvedMarkets) {
+      const existing = deduped.get(market.polymarket_id);
+      if (existing) {
+        existing.jobs.push(job);
+      } else {
+        deduped.set(market.polymarket_id, { market, eventId, jobs: [job] });
+      }
+    }
+
+    if (deduped.size !== resolvedMarkets.length) {
+      const duplicateCount = resolvedMarkets.length - deduped.size;
+      logger.info('db-writer deduped market batch before upsert', {
+        original: resolvedMarkets.length,
+        unique: deduped.size,
+        duplicates: duplicateCount,
+        duplicateRate: `${((duplicateCount / resolvedMarkets.length) * 100).toFixed(2)}%`
+      });
+
+      // Log the specific polymarket IDs that were duplicated for debugging
+      const duplicateIds: string[] = [];
+      const seenIds = new Set<string>();
+      for (const { market } of resolvedMarkets) {
+        if (seenIds.has(market.polymarket_id)) {
+          duplicateIds.push(market.polymarket_id);
+        } else {
+          seenIds.add(market.polymarket_id);
+        }
+      }
+
+      if (duplicateIds.length > 0) {
+        logger.debug('db-writer duplicate market polymarket IDs detected', {
+          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
+          totalDuplicates: duplicateIds.length
+        });
+      }
+    }
+
+    // Batch upsert deduplicated markets
+    if (deduped.size > 0) {
+      await this.upsertMarkets(Array.from(deduped.values()));
+      processed += resolvedMarkets.length; // Count all original jobs as processed
+    }
+
     return processed;
   }
 
@@ -142,12 +231,70 @@ export class DbWriterWorker {
   }
 
   private async processOutcomeJobs(jobs: UpdateJob<NormalizedOutcome>[]): Promise<number> {
+    if (jobs.length === 0) return 0;
+
+    // Separate jobs by dependency resolution
+    const resolvedOutcomes: Array<{ outcome: NormalizedOutcome; marketId: string; job: UpdateJob<NormalizedOutcome> }> = [];
     let processed = 0;
+
+    // First pass: resolve market IDs and separate failed resolutions
     for (const job of jobs) {
-      if (await this.processOutcomeJob(job)) {
-        processed += 1;
+      const outcome = job.payload;
+      const marketId = await this.resolveMarketId(outcome.market_polymarket_id);
+      if (marketId) {
+        resolvedOutcomes.push({ outcome, marketId, job });
+      } else {
+        if (await this.handleMissingMarketForOutcome(outcome, job)) {
+          processed += 1;
+        }
       }
     }
+
+    // Deduplicate resolved outcomes
+    const deduped = new Map<string, { outcome: NormalizedOutcome; marketId: string; jobs: UpdateJob<NormalizedOutcome>[] }>();
+    for (const { outcome, marketId, job } of resolvedOutcomes) {
+      const existing = deduped.get(outcome.polymarket_id);
+      if (existing) {
+        existing.jobs.push(job);
+      } else {
+        deduped.set(outcome.polymarket_id, { outcome, marketId, jobs: [job] });
+      }
+    }
+
+    if (deduped.size !== resolvedOutcomes.length) {
+      const duplicateCount = resolvedOutcomes.length - deduped.size;
+      logger.info('db-writer deduped outcome batch before upsert', {
+        original: resolvedOutcomes.length,
+        unique: deduped.size,
+        duplicates: duplicateCount,
+        duplicateRate: `${((duplicateCount / resolvedOutcomes.length) * 100).toFixed(2)}%`
+      });
+
+      // Log the specific polymarket IDs that were duplicated for debugging
+      const duplicateIds: string[] = [];
+      const seenIds = new Set<string>();
+      for (const { outcome } of resolvedOutcomes) {
+        if (seenIds.has(outcome.polymarket_id)) {
+          duplicateIds.push(outcome.polymarket_id);
+        } else {
+          seenIds.add(outcome.polymarket_id);
+        }
+      }
+
+      if (duplicateIds.length > 0) {
+        logger.debug('db-writer duplicate outcome polymarket IDs detected', {
+          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
+          totalDuplicates: duplicateIds.length
+        });
+      }
+    }
+
+    // Batch upsert deduplicated outcomes
+    if (deduped.size > 0) {
+      await this.upsertOutcomes(Array.from(deduped.values()));
+      processed += resolvedOutcomes.length; // Count all original jobs as processed
+    }
+
     return processed;
   }
 
@@ -185,8 +332,42 @@ export class DbWriterWorker {
 
   private async upsertEvents(batch: NormalizedEvent[]): Promise<void> {
     if (batch.length === 0) return;
+    const deduped = new Map<string, NormalizedEvent>();
+    for (const event of batch) {
+      deduped.set(event.polymarket_id, event);
+    }
+
+    if (deduped.size !== batch.length) {
+      const duplicateCount = batch.length - deduped.size;
+      logger.info('db-writer deduped event batch before upsert', {
+        original: batch.length,
+        unique: deduped.size,
+        duplicates: duplicateCount,
+        duplicateRate: `${((duplicateCount / batch.length) * 100).toFixed(2)}%`
+      });
+
+      // Log the specific polymarket IDs that were duplicated for debugging
+      const duplicateIds: string[] = [];
+      const seenIds = new Set<string>();
+      for (const event of batch) {
+        if (seenIds.has(event.polymarket_id)) {
+          duplicateIds.push(event.polymarket_id);
+        } else {
+          seenIds.add(event.polymarket_id);
+        }
+      }
+
+      if (duplicateIds.length > 0) {
+        logger.debug('db-writer duplicate event polymarket IDs detected', {
+          duplicateIds: duplicateIds.slice(0, 10), // Log up to 10 duplicates
+          totalDuplicates: duplicateIds.length
+        });
+      }
+    }
+
+    const uniqueEvents = Array.from(deduped.values());
     const now = new Date();
-    const values = batch.map((event) => ({
+    const values = uniqueEvents.map((event) => ({
       polymarketId: event.polymarket_id,
       title: event.title,
       slug: event.slug,
@@ -205,31 +386,142 @@ export class DbWriterWorker {
       updatedAt: now
     }));
 
-    await this.withRateLimitHandling(
+    await this.withConstraintHandling(
       () =>
-        db.insert(events)
-      .values(values)
-      .onConflictDoUpdate({
-        target: events.polymarketId,
-        set: {
-          title: sql`excluded.title`,
-          slug: sql`excluded.slug`,
-          description: sql`excluded.description`,
-          category: sql`excluded.category`,
-          liquidity: sql`excluded.liquidity`,
-          volume24h: sql`excluded.volume_24h`,
-          volumeTotal: sql`excluded.volume_total`,
-          active: sql`excluded.active`,
-          closed: sql`excluded.closed`,
-          archived: sql`excluded.archived`,
-          restricted: sql`excluded.restricted`,
-          startDate: sql`excluded.start_date`,
-          endDate: sql`excluded.end_date`,
-          lastIngestedAt: sql`excluded.last_ingested_at`,
-          updatedAt: sql`excluded.updated_at`
-        }
-      }),
+        this.withRateLimitHandling(
+          () =>
+            db.insert(events)
+              .values(values)
+              .onConflictDoUpdate({
+                target: events.polymarketId,
+                set: {
+                  title: sql`excluded.title`,
+                  slug: sql`excluded.slug`,
+                  description: sql`excluded.description`,
+                  category: sql`excluded.category`,
+                  liquidity: sql`excluded.liquidity`,
+                  volume24h: sql`excluded.volume_24h`,
+                  volumeTotal: sql`excluded.volume_total`,
+                  active: sql`excluded.active`,
+                  closed: sql`excluded.closed`,
+                  archived: sql`excluded.archived`,
+                  restricted: sql`excluded.restricted`,
+                  startDate: sql`excluded.start_date`,
+                  endDate: sql`excluded.end_date`,
+                  lastIngestedAt: sql`excluded.last_ingested_at`,
+                  updatedAt: sql`excluded.updated_at`
+                }
+              }),
+          'events-upsert'
+        ),
       'events-upsert'
+    );
+  }
+
+  private async upsertMarkets(batch: Array<{ market: NormalizedMarket; eventId: string; jobs: UpdateJob<NormalizedMarket>[] }>): Promise<void> {
+    if (batch.length === 0) return;
+
+    const now = new Date();
+    const values = batch.map(({ market, eventId }) => ({
+      polymarketId: market.polymarket_id,
+      eventId,
+      question: market.question,
+      slug: market.slug,
+      description: market.description,
+      liquidity: this.decimal(market.liquidity) ?? '0',
+      volume24h: this.decimal(market.volume) ?? '0',
+      volumeTotal: this.decimal(market.volume) ?? '0',
+      currentPrice: this.decimal(market.current_price),
+      lastTradePrice: this.decimal(market.last_trade_price),
+      bestBid: this.decimal(market.best_bid),
+      bestAsk: this.decimal(market.best_ask),
+      status: market.status,
+      resolvedAt: this.toDate(market.resolved_at),
+      active: market.is_active,
+      closed: market.closed,
+      archived: market.archived,
+      restricted: market.restricted,
+      approved: market.approved,
+      relevanceScore: market.relevance_score,
+      lastIngestedAt: now,
+      updatedAt: now
+    }));
+
+    await this.withConstraintHandling(
+      () =>
+        this.withRateLimitHandling(
+          () =>
+            db.insert(markets)
+              .values(values)
+              .onConflictDoUpdate({
+                target: markets.polymarketId,
+                set: {
+                  question: sql`excluded.question`,
+                  slug: sql`excluded.slug`,
+                  description: sql`excluded.description`,
+                  liquidity: sql`excluded.liquidity`,
+                  volume24h: sql`excluded.volume_24h`,
+                  volumeTotal: sql`excluded.volume_total`,
+                  currentPrice: sql`excluded.current_price`,
+                  lastTradePrice: sql`excluded.last_trade_price`,
+                  bestBid: sql`excluded.best_bid`,
+                  bestAsk: sql`excluded.best_ask`,
+                  status: sql`excluded.status`,
+                  resolvedAt: sql`excluded.resolved_at`,
+                  active: sql`excluded.active`,
+                  closed: sql`excluded.closed`,
+                  archived: sql`excluded.archived`,
+                  restricted: sql`excluded.restricted`,
+                  approved: sql`excluded.approved`,
+                  relevanceScore: sql`excluded.relevance_score`,
+                  lastIngestedAt: sql`excluded.last_ingested_at`,
+                  updatedAt: sql`excluded.updated_at`
+                }
+              }),
+          'markets-upsert'
+        ),
+      'markets-upsert'
+    );
+  }
+
+  private async upsertOutcomes(batch: Array<{ outcome: NormalizedOutcome; marketId: string; jobs: UpdateJob<NormalizedOutcome>[] }>): Promise<void> {
+    if (batch.length === 0) return;
+
+    const values = batch.map(({ outcome, marketId }) => ({
+      polymarketId: outcome.polymarket_id,
+      marketId,
+      title: outcome.title,
+      description: outcome.description,
+      price: this.decimal(outcome.price) ?? '0',
+      probability: this.decimal(outcome.probability) ?? '0',
+      volume: this.decimal(outcome.volume) ?? '0',
+      status: outcome.status,
+      displayOrder: outcome.display_order,
+      updatedAt: new Date()
+    }));
+
+    await this.withConstraintHandling(
+      () =>
+        this.withRateLimitHandling(
+          () =>
+            db.insert(outcomes)
+              .values(values)
+              .onConflictDoUpdate({
+                target: outcomes.polymarketId,
+                set: {
+                  title: sql`excluded.title`,
+                  description: sql`excluded.description`,
+                  price: sql`excluded.price`,
+                  probability: sql`excluded.probability`,
+                  volume: sql`excluded.volume`,
+                  status: sql`excluded.status`,
+                  displayOrder: sql`excluded.display_order`,
+                  updatedAt: sql`excluded.updated_at`
+                }
+              }),
+          'outcomes-upsert'
+        ),
+      'outcomes-upsert'
     );
   }
 
@@ -499,6 +791,34 @@ export class DbWriterWorker {
     if (!error) return false;
     const message = error instanceof Error ? error.message : String(error);
     return message.toLowerCase().includes('too many concurrent writes');
+  }
+
+  private isConstraintViolationError(error: unknown): boolean {
+    if (!error) return false;
+    const message = error instanceof Error ? error.message : String(error);
+    return message.toLowerCase().includes('on conflict do update') ||
+           message.toLowerCase().includes('duplicate key') ||
+           message.toLowerCase().includes('unique constraint') ||
+           message.toLowerCase().includes('cardinality violation') ||
+           message.includes('21000'); // PostgreSQL cardinality violation error code
+  }
+
+  private async withConstraintHandling<T>(operation: () => Promise<T>, context: string): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (this.isConstraintViolationError(error)) {
+        logger.error('db-writer constraint violation detected', {
+          context,
+          error: formatError(error)
+        });
+
+        // For constraint violations, we want to fail fast and not retry
+        // as retrying the same operation will likely fail again
+        throw new Error(`Constraint violation in ${context}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      throw error;
+    }
   }
 }
 
