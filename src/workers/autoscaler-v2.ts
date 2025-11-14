@@ -37,20 +37,31 @@ export class AutoscalerV2 {
   private coordinationKey = "autoscaler:coordination_lock";
 
   async start(): Promise<void> {
-    if (this.timer) return;
+    console.log("[AUTOSCALER-DEBUG] Starting autoscaler V2...");
 
-    // Try to become primary autoscaler
-    this.isPrimary = await this.acquireCoordinationLock();
-
-    if (!this.isPrimary) {
-      logger.info("[autoscaler-v2] starting as standby autoscaler");
-      // Standby mode: just monitor and become primary if current primary fails
-      this.timer = setInterval(() => void this.monitorPrimary(), POLL_INTERVAL_MS);
+    if (this.timer) {
+      console.log("[AUTOSCALER-DEBUG] Timer already exists, returning");
       return;
     }
 
+    console.log("[AUTOSCALER-DEBUG] Attempting to acquire coordination lock...");
+    // Try to become primary autoscaler
+    this.isPrimary = await this.acquireCoordinationLock();
+    console.log("[AUTOSCALER-DEBUG] Coordination lock result:", this.isPrimary);
+
+    if (!this.isPrimary) {
+      console.log("[AUTOSCALER-DEBUG] Starting as standby autoscaler");
+      logger.info("[autoscaler-v2] starting as standby autoscaler");
+      // Standby mode: just monitor and become primary if current primary fails
+      this.timer = setInterval(() => void this.monitorPrimary(), POLL_INTERVAL_MS);
+      console.log("[AUTOSCALER-DEBUG] Standby timer started");
+      return;
+    }
+
+    console.log("[AUTOSCALER-DEBUG] Starting as primary autoscaler");
     logger.info("[autoscaler-v2] starting as primary autoscaler");
     this.timer = setInterval(() => void this.checkAndScale(), POLL_INTERVAL_MS);
+    console.log("[AUTOSCALER-DEBUG] Primary timer started, calling checkAndScale");
     void this.checkAndScale();
   }
 
