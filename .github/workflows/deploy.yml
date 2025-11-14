@@ -23,8 +23,20 @@ jobs:
         run: |
           ssh -i ~/.ssh/id_ed25519 root@143.198.185.76 "
             cd ~/signalcast-ingestor &&
+            echo '🔄 Pulling latest changes...' &&
             git pull &&
+            echo '📦 Installing dependencies...' &&
             pnpm install &&
+            echo '🏗️ Building V2 architecture...' &&
             pnpm run build &&
-            pm2 restart ingestor
+            echo '⏹️ Stopping all processes...' &&
+            pm2 stop all || true &&
+            pm2 delete all || true &&
+            echo '🚀 Starting V2 architecture...' &&
+            pm2 start pm2.config.js &&
+            echo '💾 Saving process list...' &&
+            pm2 save &&
+            echo '📊 Showing process status...' &&
+            pm2 list &&
+            echo '✅ Deployment complete!'
           "
