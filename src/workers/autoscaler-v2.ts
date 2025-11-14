@@ -356,25 +356,38 @@ export class AutoscalerV2 {
   }
 
   private async getCurrentDbWriterWorkers(): Promise<number> {
+    console.log("[AUTOSCALER-DEBUG] Getting current db-writer workers via PM2...");
     return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        console.log("[AUTOSCALER-DEBUG] PM2 operation timed out, defaulting to 1 worker");
+        reject(new Error("PM2 operation timeout"));
+      }, 5000); // 5 second timeout
+
       pm2.connect((err) => {
         if (err) {
+          clearTimeout(timeout);
+          console.log("[AUTOSCALER-DEBUG] PM2 connect failed:", err);
           reject(err);
           return;
         }
 
+        console.log("[AUTOSCALER-DEBUG] PM2 connected, getting process list...");
         pm2.list((listErr, list) => {
+          clearTimeout(timeout);
           pm2.disconnect();
 
           if (listErr) {
+            console.log("[AUTOSCALER-DEBUG] PM2 list failed:", listErr);
             reject(listErr);
             return;
           }
 
+          console.log("[AUTOSCALER-DEBUG] PM2 list returned", list.length, "processes");
           const dbWriterCount = list.filter(p =>
             p.name && p.name.startsWith("db-writer-")
           ).length;
 
+          console.log("[AUTOSCALER-DEBUG] Found", dbWriterCount, "db-writer workers");
           resolve(dbWriterCount);
         });
       });
