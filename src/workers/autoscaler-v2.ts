@@ -228,9 +228,15 @@ export class AutoscalerV2 {
   }
 
   private async scaleBasedOnEventsQueue(bootstrapStatus: any): Promise<void> {
+    console.log("[AUTOSCALER-DEBUG] scaleBasedOnEventsQueue called...");
     try {
+      console.log("[AUTOSCALER-DEBUG] Getting events queue length...");
       const eventsQueueLength = await redis.llen(EVENTS_QUEUE_KEY);
+      console.log("[AUTOSCALER-DEBUG] Events queue length:", eventsQueueLength);
+
+      console.log("[AUTOSCALER-DEBUG] Getting current workers...");
       const currentWorkers = await this.getCurrentDbWriterWorkers();
+      console.log("[AUTOSCALER-DEBUG] Current workers:", currentWorkers);
 
       let desiredWorkers = MIN_WORKERS;
       let reason = "";
@@ -310,8 +316,12 @@ export class AutoscalerV2 {
   }
 
   private async scaleToWorkers(desiredCount: number, reason: string): Promise<void> {
-    if (this.scalingInProgress) return;
+    if (this.scalingInProgress) {
+      console.log("[AUTOSCALER-DEBUG] scaleToWorkers called but scaling already in progress");
+      return;
+    }
 
+    console.log("[AUTOSCALER-DEBUG] Starting scaleToWorkers, setting scalingInProgress = true");
     this.scalingInProgress = true;
 
     try {
@@ -340,6 +350,7 @@ export class AutoscalerV2 {
         error: formatError(error)
       });
     } finally {
+      console.log("[AUTOSCALER-DEBUG] scaleToWorkers completed, resetting scalingInProgress = false");
       this.scalingInProgress = false;
     }
   }

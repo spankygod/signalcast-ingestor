@@ -23,7 +23,13 @@ logger.info("db-writer-v2 starting worker process", {
   workerId,
   targetQueue: "signalcast:queue:events, markets, outcomes, ticks"
 });
-dbWriterWorkerV2.start();
+console.log("[DB-WRITER-DEBUG] About to start dbWriterWorkerV2...");
+try {
+  dbWriterWorkerV2.start();
+  console.log("[DB-WRITER-DEBUG] dbWriterWorkerV2 started successfully");
+} catch (error) {
+  console.log("[DB-WRITER-DEBUG] Failed to start dbWriterWorkerV2:", error);
+}
 
 const shutdown = async (signal: NodeJS.Signals) => {
   logger.info('db-writer-v2 standalone received shutdown signal', { signal });
