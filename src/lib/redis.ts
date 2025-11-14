@@ -48,6 +48,10 @@ class NoOpRedis {
     return 0;
   }
 
+  async keys(pattern: string): Promise<string[]> {
+    return [];
+  }
+
   on(event: string, callback: (...args: any[]) => void): void {
     // No-op when Redis is not available
   }
@@ -209,6 +213,14 @@ const redisFallback = {
     if (redisInstance) {
       redisInstance.removeAllListeners();
     }
+  },
+
+  async keys(pattern: string): Promise<string[]> {
+    if (redisAvailable && redisInstance) {
+      return await redisInstance.keys(pattern);
+    }
+    scheduleReconnect();
+    return [];
   },
 
   quit(): void {

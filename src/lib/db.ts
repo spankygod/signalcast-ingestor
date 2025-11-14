@@ -218,3 +218,5 @@ function getClient() {
 export const db = drizzle(getClient(), {
   schema: { events, markets, outcomes, marketPricesRealtime },
 });
+
+export const dbInstance = db;

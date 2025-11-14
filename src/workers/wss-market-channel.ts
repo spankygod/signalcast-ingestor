@@ -5,10 +5,11 @@ import { pushUpdate } from "../queues/updates.queue";
 import { normalizeTick, NormalizedTick } from "../utils/normalizeTick";
 import { sleep } from "../lib/retry";
 import { heartbeatMonitor } from "./heartbeat";
-import { WORKERS } from "../utils/constants";
-import { redisAvailable } from "../lib/redis";
+import { WORKERS, QUEUES } from "../utils/constants";
+import { redisAvailable, redis } from "../lib/redis";
 import { settings } from "../config/settings";
 import { politicsFilter } from "../utils/politicsFilter";
+import { bootstrap } from "../lib/bootstrap";
 
 const WORKER_NAME = WORKERS.marketChannel;
 
@@ -156,7 +157,7 @@ export class MarketChannelWorker {
 
         const tick = normalizeTick(this.toMarket(marketPayload));
 
-        if (this.shouldEnqueueTick()) {
+        if (await this.shouldEnqueueTick()) {
           await pushUpdate("tick", tick);
         } else {
           this.logTick(tick);
@@ -236,9 +237,31 @@ export class MarketChannelWorker {
     };
   }
 
-  private shouldEnqueueTick(): boolean {
-    return settings.redisEnabled && redisAvailable;
+private async shouldEnqueueTick(): Promise<boolean> {
+  // If bootstrap not done, don’t enqueue ticks yet
+  const eventsDone = await bootstrap.isDone("events_done");
+  const marketsDone = await bootstrap.isDone("markets_done");
+  if (!eventsDone || !marketsDone) return false;
+
+  if (!settings.redisEnabled || !redisAvailable) return false;
+
+  try {
+    const backlog = await redis.llen(QUEUES.ticks);
+    if (backlog >= settings.tickQueueBacklogThreshold) {
+      logger.warn(
+        `${WORKER_NAME} dropping ticks due to backlog`,
+        { backlog },
+      );
+      return false;
+    }
+  } catch (e) {
+    logger.warn(`${WORKER_NAME} failed to read tick backlog`, {
+      error: formatError(e),
+    });
   }
+
+  return true;
+}
 
   private logTick(tick: NormalizedTick): void {
     console.log(`[${WORKER_NAME}]`, "tick (redis disabled)", {

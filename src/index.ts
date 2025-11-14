@@ -6,7 +6,6 @@ import { eventsPoller } from "./workers/events-poller";
 import { marketsPoller } from "./workers/markets-poller";
 import { outcomesPoller } from "./workers/outcomes-poller";
 import { marketChannelWorker } from "./workers/wss-market-channel";
-import { dbWriterWorker } from "./workers/db-writer";
 import { heartbeatMonitor } from "./workers/heartbeat";
 
 const workers = [
@@ -14,7 +13,6 @@ const workers = [
   { name: 'markets-poller', start: () => marketsPoller.start(), stop: () => marketsPoller.stop() },
   { name: 'outcomes-poller', start: () => outcomesPoller.start(), stop: () => outcomesPoller.stop() },
   { name: 'wss-market-channel', start: () => marketChannelWorker.start(), stop: () => marketChannelWorker.stop() },
-  { name: 'db-writer', start: () => dbWriterWorker.start(), stop: () => dbWriterWorker.stop() },
   { name: 'heartbeat', start: () => heartbeatMonitor.start(), stop: () => heartbeatMonitor.stop() }
 ];
 

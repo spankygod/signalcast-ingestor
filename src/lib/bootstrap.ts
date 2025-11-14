@@ -1,16 +1,29 @@
+// src/lib/bootstrap.ts
 import { redis } from "./redis";
 
+const PREFIX = "bootstrap";
+
+function key(name: string) {
+  return `${PREFIX}:${name}`;
+}
+
 export const bootstrap = {
-  async isDone(key: string) {
-    return (await redis.get(`bootstrap:${key}`)) === "1";
+  async isDone(name: string): Promise<boolean> {
+    const v = await redis.get(key(name));
+    return v === "1";
   },
 
-  async setDone(key: string) {
-    await redis.set(`bootstrap:${key}`, "1");
+  async setDone(name: string): Promise<void> {
+    await redis.set(key(name), "1");
   },
 
-  async reset() {
-    await redis.del("bootstrap:events_done");
-    await redis.del("bootstrap:markets_done");
-  }
+  async clearAll(): Promise<void> {
+    const pattern = `${PREFIX}:*`;
+    const keys = await redis.keys(pattern);
+    if (keys.length) {
+      for (const key of keys) {
+        await redis.del(key);
+      }
+    }
+  },
 };
