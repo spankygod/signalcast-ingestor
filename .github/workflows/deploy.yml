@@ -17,10 +17,10 @@ jobs:
 
       - name: Setup SSH
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
+          mkdir -p $HOME/.ssh
+          ssh-keyscan -H "$VPS_HOST" >> $HOME/.ssh/known_hosts
+          echo "${{ secrets.VPS_SSH_KEY }}" > $HOME/.ssh/id_ed25519
+          chmod 600 $HOME/.ssh/id_ed25519
 
       - name: Deploy to VPS
         env:
@@ -46,4 +46,4 @@ jobs:
 
       - name: Cleanup SSH key
         if: always()
-        run: rm -f ~/.ssh/id_ed25519
+        run: rm -f $HOME/.ssh/id_ed25519
