@@ -305,14 +305,18 @@ export async function setupConsumerGroups(): Promise<void> {
         );
         console.log(`Created consumer group ${REDIS_CONSUMER_GROUPS.PRIMARY} for stream ${stream}`);
       } catch (error: any) {
-        if (error.code === 'BUSYGROUP') {
+        const message = typeof error?.message === 'string' ? error.message : '';
+        const isBusyGroup = error?.code === 'BUSYGROUP' || message.includes('BUSYGROUP');
+
+        if (isBusyGroup) {
           // Consumer group already exists, which is fine
           if (features.debug) {
             console.log(`Consumer group ${REDIS_CONSUMER_GROUPS.PRIMARY} already exists for stream ${stream}`);
           }
-        } else {
-          console.warn(`Error creating consumer group for stream ${stream}:`, error);
+          continue;
         }
+
+        console.warn(`Error creating consumer group for stream ${stream}:`, error);
       }
     }
   } catch (error) {

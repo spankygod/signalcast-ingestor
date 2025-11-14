@@ -4,7 +4,7 @@
  */
 
 import crypto from 'crypto';
-import { Logger, LoggerFactory } from '../lib/logger';
+import { Logger, LoggerFactory, LogCategory } from '../lib/logger';
 import { retryUtils } from '../lib/retry';
 import { POLYMARKET_CONFIG, AUTH_CONFIG, REQUEST_CONFIG, ERROR_HANDLING } from '../config/polymarket';
 
@@ -71,7 +71,7 @@ export class PolymarketAuthService {
 
   constructor() {
     this.logger = LoggerFactory.getLogger('polymarket-auth', {
-      category: 'API',
+      category: LogCategory.API,
     });
 
     this.credentials = {
@@ -117,11 +117,15 @@ export class PolymarketAuthService {
    * Authenticate with Polymarket API
    */
   async authenticate(): Promise<AuthResult> {
-    return this.logger.timed('authenticate', this.logger.getLevel(), async () => {
-      return await retryUtils.withExponentialBackoff(
-        async () => {
-          try {
-            this.logger.debug('Attempting authentication');
+    return this.logger.timed(
+      'authenticate',
+      LogCategory.API,
+      this.logger.getLevel(),
+      async () => {
+        return await retryUtils.withExponentialBackoff(
+          async () => {
+            try {
+              this.logger.debug('Attempting authentication');
 
             // For now, simulate authentication with API key
             // In real implementation, this would make API calls to get tokens
@@ -156,14 +160,14 @@ export class PolymarketAuthService {
               authenticated: false,
               error: error instanceof Error ? error.message : 'Unknown authentication error',
             };
-          }
-        },
-        ERROR_HANDLING.MAX_RETRIES.AUTHENTICATION,
-        AUTH_CONFIG.JWT.REFRESH_THRESHOLD_SECONDS * 1000,
-        30000, // maxDelay
-        this.logger
-      );
-    });
+          },
+          ERROR_HANDLING.MAX_RETRIES.AUTHENTICATION,
+          AUTH_CONFIG.JWT.REFRESH_THRESHOLD_SECONDS * 1000,
+          30000, // maxDelay
+          this.logger
+        );
+      }
+    );
   }
 
   /**
