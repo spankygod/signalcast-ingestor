@@ -40,6 +40,10 @@ export class DbWriterWorkerV2 {
   private draining = false;
   private retryQueue = new Map<string, RetryableJob>();
   private starting = false;
+  private lastDrainTime = 0;
+  private lastSuccessfulOperation = Date.now();
+  private healthCheckTimer: NodeJS.Timeout | null = null;
+  private deadlockDetectionTimer: NodeJS.Timeout | null = null;
 
   // Configuration
   private readonly DRAIN_INTERVAL = 1000; // Increased from 200ms
@@ -47,6 +51,9 @@ export class DbWriterWorkerV2 {
   private readonly RETRY_BACKOFF_MS = [5000, 15000, 45000, 120000, 300000];
   private readonly RETRY_STORAGE_PREFIX = "signalcast:retry:db-writer";
   private readonly RETRY_STORAGE_TTL_SECONDS = 60 * 60 * 24; // 24h
+  private readonly HEALTH_CHECK_INTERVAL = 30000; // 30 seconds
+  private readonly DEADLOCK_TIMEOUT = 60000; // 60 seconds
+  private readonly OPERATION_TIMEOUT = 30000; // 30 seconds per operation
 
   private getJobIdentifier(job: UpdateJob<any>): string {
     const payload = job.payload as Record<string, unknown>;
@@ -173,7 +180,7 @@ export class DbWriterWorkerV2 {
   start(): void {
     if (this.timer || this.starting) return;
     this.starting = true;
-    logger.info("[db-writer-v2] starting with improved batch processing");
+    logger.info("[db-writer-v2] starting with health monitoring");
     void this.boot();
   }
 
@@ -181,6 +188,8 @@ export class DbWriterWorkerV2 {
     try {
       await this.restorePersistedRetries();
       this.timer = setInterval(() => void this.drain(), this.DRAIN_INTERVAL);
+      this.startHealthMonitoring();
+      this.startDeadlockDetection();
       await this.drain();
     } catch (error) {
       logger.error("[db-writer-v2] failed to initialize", {
@@ -190,6 +199,8 @@ export class DbWriterWorkerV2 {
         clearInterval(this.timer);
         this.timer = null;
       }
+      this.stopHealthMonitoring();
+      this.stopDeadlockDetection();
     } finally {
       this.starting = false;
     }
@@ -199,16 +210,148 @@ export class DbWriterWorkerV2 {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = null;
-    logger.info("[db-writer-v2] stopped");
+    this.stopHealthMonitoring();
+    this.stopDeadlockDetection();
+    logger.info("[db-writer-v2] stopped with health monitoring");
+  }
+
+  private startHealthMonitoring(): void {
+    this.healthCheckTimer = setInterval(() => {
+      this.performHealthCheck();
+    }, this.HEALTH_CHECK_INTERVAL);
+  }
+
+  private stopHealthMonitoring(): void {
+    if (this.healthCheckTimer) {
+      clearInterval(this.healthCheckTimer);
+      this.healthCheckTimer = null;
+    }
+  }
+
+  private startDeadlockDetection(): void {
+    this.deadlockDetectionTimer = setInterval(() => {
+      this.checkForDeadlocks();
+    }, this.DEADLOCK_TIMEOUT);
+  }
+
+  private stopDeadlockDetection(): void {
+    if (this.deadlockDetectionTimer) {
+      clearInterval(this.deadlockDetectionTimer);
+      this.deadlockDetectionTimer = null;
+    }
+  }
+
+  private performHealthCheck(): void {
+    const now = Date.now();
+    const timeSinceLastDrain = now - this.lastDrainTime;
+    const timeSinceLastSuccess = now - this.lastSuccessfulOperation;
+
+    logger.info("[db-writer-v2] health check", {
+      workerId: process.env.WORKER_ID || 'unknown',
+      timeSinceLastDrain,
+      timeSinceLastSuccess,
+      draining: this.draining,
+      retryQueueSize: this.retryQueue.size,
+      isTimerActive: !!this.timer
+    });
+
+    // If we haven't had a successful operation in 2 minutes, we might be stuck
+    if (timeSinceLastSuccess > 120000) {
+      logger.error("[db-writer-v2] potential hang detected", {
+        timeSinceLastSuccess,
+        lastDrainTime: this.lastDrainTime,
+        draining: this.draining,
+        retryQueueSize: this.retryQueue.size
+      });
+
+      // Try to recover by restarting the drain cycle
+      this.recoverFromHang();
+    }
+  }
+
+  private checkForDeadlocks(): void {
+    const now = Date.now();
+
+    // Check if we've been in draining state for too long
+    if (this.draining && (now - this.lastDrainTime > this.DEADLOCK_TIMEOUT)) {
+      logger.error("[db-writer-v2] deadlock detected - stuck in draining state", {
+        drainDuration: now - this.lastDrainTime,
+        retryQueueSize: this.retryQueue.size,
+        workerId: process.env.WORKER_ID || 'unknown'
+      });
+
+      // Force recovery
+      this.recoverFromDeadlock();
+    }
+  }
+
+  private recoverFromHang(): void {
+    logger.warn("[db-writer-v2] attempting recovery from hang", {
+      workerId: process.env.WORKER_ID || 'unknown'
+    });
+
+    try {
+      // Reset draining state
+      this.draining = false;
+
+      // Clear and restart timer
+      if (this.timer) {
+        clearInterval(this.timer);
+      }
+      this.timer = setInterval(() => void this.drain(), this.DRAIN_INTERVAL);
+
+      // Reset timestamps
+      this.lastDrainTime = Date.now();
+      this.lastSuccessfulOperation = Date.now();
+
+      logger.info("[db-writer-v2] recovery completed");
+    } catch (error) {
+      logger.error("[db-writer-v2] recovery failed", {
+        error: formatError(error)
+      });
+    }
+  }
+
+  private recoverFromDeadlock(): void {
+    logger.error("[db-writer-v2] forcing recovery from deadlock", {
+      workerId: process.env.WORKER_ID || 'unknown'
+    });
+
+    try {
+      // Force reset all states
+      this.draining = false;
+
+      // Clear all timers
+      if (this.timer) {
+        clearInterval(this.timer);
+        this.timer = null;
+      }
+
+      // Restart everything
+      this.timer = setInterval(() => void this.drain(), this.DRAIN_INTERVAL);
+      this.lastDrainTime = Date.now();
+      this.lastSuccessfulOperation = Date.now();
+
+      logger.error("[db-writer-v2] forced deadlock recovery completed");
+    } catch (error) {
+      logger.error("[db-writer-v2] forced deadlock recovery failed", {
+        error: formatError(error)
+      });
+    }
   }
 
   private async drain(): Promise<void> {
     if (this.draining) return;
     this.draining = true;
+    this.lastDrainTime = Date.now();
+
+    const drainStartTime = Date.now();
+    let processedAny = false;
 
     try {
       // Process retry queue first
-      await this.processRetryQueue();
+      const retryProcessed = await this.processRetryQueue();
+      if (retryProcessed > 0) processedAny = true;
 
       // Get bootstrap status to determine processing strategy
       const bootstrapStatus = await BootstrapCoordinator.getBootstrapStatus();
@@ -216,23 +359,42 @@ export class DbWriterWorkerV2 {
       logger.debug("[db-writer-v2] drain cycle", {
         bootstrapStatus,
         retryQueueSize: this.retryQueue.size,
-        workerId: process.env.WORKER_ID || 'unknown'
+        workerId: process.env.WORKER_ID || 'unknown',
+        drainStartTime
       });
 
       if (bootstrapStatus.complete) {
         // Normal operation: process all queues
         logger.debug("[db-writer-v2] processing all queues (post-bootstrap)");
-        await this.processAllQueues();
+        const queueProcessed = await this.processAllQueues();
+        if (queueProcessed > 0) processedAny = true;
       } else {
         // Bootstrap mode: strict ordering with barriers
         logger.debug("[db-writer-v2] processing in bootstrap mode", {
           stage: this.getCurrentBootstrapStage(bootstrapStatus)
         });
-        await this.processBootstrapMode(bootstrapStatus);
+        const queueProcessed = await this.processBootstrapMode(bootstrapStatus);
+        if (queueProcessed > 0) processedAny = true;
       }
 
+      // Update success timestamp if we processed anything
+      if (processedAny) {
+        this.lastSuccessfulOperation = Date.now();
+      }
+
+      const drainDuration = Date.now() - drainStartTime;
+      logger.debug("[db-writer-v2] drain cycle completed", {
+        duration: drainDuration,
+        processedAny,
+        workerId: process.env.WORKER_ID || 'unknown'
+      });
+
     } catch (error) {
-      logger.error("[db-writer-v2] drain failed", { error: formatError(error) });
+      logger.error("[db-writer-v2] drain failed", {
+        error: formatError(error),
+        duration: Date.now() - drainStartTime,
+        workerId: process.env.WORKER_ID || 'unknown'
+      });
     } finally {
       this.draining = false;
     }
@@ -245,8 +407,8 @@ export class DbWriterWorkerV2 {
     return "complete";
   }
 
-  private async processRetryQueue(): Promise<void> {
-    if (this.retryQueue.size === 0) return;
+  private async processRetryQueue(): Promise<number> {
+    if (this.retryQueue.size === 0) return 0;
 
     const now = Date.now();
     const readyJobs: { key: string; job: RetryableJob }[] = [];
@@ -258,19 +420,22 @@ export class DbWriterWorkerV2 {
       }
     }
 
-    if (readyJobs.length === 0) return;
+    if (readyJobs.length === 0) return 0;
 
     logger.info("[db-writer-v2] processing retry queue", {
       retryJobs: readyJobs.length,
       remainingInQueue: this.retryQueue.size
     });
 
+    let processedCount = 0;
     for (const { key, job } of readyJobs) {
       const success = await this.retryJob(job);
       if (success) {
         await this.removePersistedRetry(key);
+        processedCount++;
       }
     }
+    return processedCount;
   }
 
   private async retryJob(job: RetryableJob): Promise<boolean> {
@@ -312,38 +477,37 @@ export class DbWriterWorkerV2 {
     }
   }
 
-  private async processBootstrapMode(bootstrapStatus: any): Promise<void> {
+  private async processBootstrapMode(bootstrapStatus: any): Promise<number> {
     logger.debug("[db-writer-v2] processing in bootstrap mode", bootstrapStatus);
 
     // Process events until barrier is reached and queue is empty
     if (!bootstrapStatus.events) {
-      await this.processEventsUntilBarrier();
-      return;
+      return await this.processEventsUntilBarrier();
     }
 
     // Process markets until events are done and markets barrier is reached
     if (!bootstrapStatus.markets) {
       const eventsEmpty = await BootstrapCoordinator.areQueuesEmptyForStage("events");
       if (eventsEmpty) {
-        await this.processMarketsUntilBarrier();
+        return await this.processMarketsUntilBarrier();
       }
-      return;
+      return 0;
     }
 
     // Process outcomes until markets are done and outcomes barrier is reached
     if (!bootstrapStatus.outcomes) {
       const marketsEmpty = await BootstrapCoordinator.areQueuesEmptyForStage("markets");
       if (marketsEmpty) {
-        await this.processOutcomesUntilBarrier();
+        return await this.processOutcomesUntilBarrier();
       }
-      return;
+      return 0;
     }
 
     // Bootstrap complete, process ticks
-    await this.processTicks();
+    return await this.processTicks();
   }
 
-  private async processAllQueues(): Promise<void> {
+  private async processAllQueues(): Promise<number> {
     logger.debug("[db-writer-v2] processing all queues");
 
     // Process in priority order, but allow some interleaving for throughput
@@ -354,8 +518,10 @@ export class DbWriterWorkerV2 {
       { kind: "tick" as UpdateKind, batchSize: settings.dbWriterBatchSize.ticks },
     ];
 
+    let totalProcessed = 0;
     for (const stage of pipeline) {
       const processed = await this.processQueue(stage.kind, stage.batchSize);
+      totalProcessed += processed;
       if (processed > 0) {
         heartbeatMonitor.beat(WORKERS.dbWriter, {
           stage: stage.kind,
@@ -363,16 +529,17 @@ export class DbWriterWorkerV2 {
         });
       }
     }
+    return totalProcessed;
   }
 
-  private async processEventsUntilBarrier(): Promise<void> {
+  private async processEventsUntilBarrier(): Promise<number> {
     const processed = await this.processQueue("event", settings.dbWriterBatchSize.events);
     if (processed > 0) {
       heartbeatMonitor.beat(WORKERS.dbWriter, {
         stage: "event",
         processed,
       });
-      return;
+      return processed;
     }
 
     // No more events, check if queue is empty
@@ -382,39 +549,42 @@ export class DbWriterWorkerV2 {
       await BootstrapCoordinator.setStageBarrier("events", processed);
       logger.info("[db-writer-v2] events stage barrier set");
     }
+    return processed;
   }
 
-  private async processMarketsUntilBarrier(): Promise<void> {
+  private async processMarketsUntilBarrier(): Promise<number> {
     const processed = await this.processQueue("market", settings.dbWriterBatchSize.markets);
     if (processed > 0) {
       heartbeatMonitor.beat(WORKERS.dbWriter, {
         stage: "market",
         processed,
       });
-      return;
+      return processed;
     }
 
     // No more markets, set barrier
     await BootstrapCoordinator.setStageBarrier("markets", processed);
     logger.info("[db-writer-v2] markets stage barrier set");
+    return processed;
   }
 
-  private async processOutcomesUntilBarrier(): Promise<void> {
+  private async processOutcomesUntilBarrier(): Promise<number> {
     const processed = await this.processQueue("outcome", settings.dbWriterBatchSize.outcomes);
     if (processed > 0) {
       heartbeatMonitor.beat(WORKERS.dbWriter, {
         stage: "outcome",
         processed,
       });
-      return;
+      return processed;
     }
 
     // No more outcomes, set barrier
     await BootstrapCoordinator.setStageBarrier("outcomes", processed);
     logger.info("[db-writer-v2] outcomes stage barrier set");
+    return processed;
   }
 
-  private async processTicks(): Promise<void> {
+  private async processTicks(): Promise<number> {
     const processed = await this.processQueue("tick", settings.dbWriterBatchSize.ticks);
     if (processed > 0) {
       heartbeatMonitor.beat(WORKERS.dbWriter, {
@@ -422,6 +592,7 @@ export class DbWriterWorkerV2 {
         processed,
       });
     }
+    return processed;
   }
 
   private async processQueue(
