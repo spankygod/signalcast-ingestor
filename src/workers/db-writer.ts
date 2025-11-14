@@ -15,6 +15,11 @@ import { NormalizedTick } from "../utils/normalizeTick";
 import { heartbeatMonitor } from "./heartbeat";
 import { WORKERS } from "../utils/constants";
 
+// Debug configuration
+const DEBUG_SQL_QUERIES = process.env.DEBUG_SQL_QUERIES === 'true';
+const DEBUG_QUERY_TIMEOUT = Number(process.env.DEBUG_QUERY_TIMEOUT || 30000); // 30 seconds
+const DEBUG_DETAILED_TIMING = process.env.DEBUG_DETAILED_TIMING === 'true';
+
 type PipelineStage = {
   kind: UpdateKind;
   handler: (jobs: UpdateJob<any>[]) => Promise<number>;
@@ -26,13 +31,111 @@ export class DbWriterWorker {
   private draining = false;
   private readonly maxJobAttempts = Number(process.env.JOB_MAX_ATTEMPTS || 3);
 
+  // Debug tracking
+  private lastProgressTimestamp = Date.now();
+  private currentOperation: string = 'idle';
+  private operationStartTime: number = Date.now();
+
+  // Helper method to time database operations with detailed logging
+  private async timedDbOperation<T>(
+    operationName: string,
+    operation: () => Promise<T>,
+    context?: Record<string, any>
+  ): Promise<T> {
+    const startTime = Date.now();
+    this.currentOperation = operationName;
+    this.operationStartTime = startTime;
+
+    logger.debug(`db-writer starting operation: ${operationName}`, {
+      operation: operationName,
+      startTime,
+      ...context
+    });
+
+    try {
+      // Set up timeout warning
+      const timeoutWarning = setTimeout(() => {
+        const elapsed = Date.now() - startTime;
+        logger.warn(`db-writer operation taking too long: ${operationName}`, {
+          operation: operationName,
+          elapsed: `${elapsed}ms`,
+          context,
+          operationId: startTime
+        });
+      }, DEBUG_QUERY_TIMEOUT / 2); // Warn at half the timeout
+
+      const result = await Promise.race([
+        operation(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => {
+            const elapsed = Date.now() - startTime;
+            logger.error(`db-writer operation timeout: ${operationName}`, {
+              operation: operationName,
+              elapsed: `${elapsed}ms`,
+              context,
+              operationId: startTime
+            });
+            reject(new Error(`Database operation timeout: ${operationName} after ${elapsed}ms`));
+          }, DEBUG_QUERY_TIMEOUT)
+        )
+      ]);
+
+      clearTimeout(timeoutWarning);
+      const duration = Date.now() - startTime;
+      this.lastProgressTimestamp = Date.now();
+      this.currentOperation = 'idle';
+
+      logger.debug(`db-writer completed operation: ${operationName}`, {
+        operation: operationName,
+        duration: `${duration}ms`,
+        success: true,
+        ...context
+      });
+
+      return result;
+    } catch (error) {
+      const duration = Date.now() - startTime;
+      this.currentOperation = 'error';
+
+      logger.error(`db-writer operation failed: ${operationName}`, {
+        operation: operationName,
+        duration: `${duration}ms`,
+        error: formatError(error),
+        ...context
+      });
+
+      throw error;
+    }
+  }
+
   start(): void {
     if (this.timer) return;
-    logger.info("db-writer starting");
+    logger.info("db-writer starting", {
+      debugConfig: {
+        sqlQueries: DEBUG_SQL_QUERIES,
+        queryTimeout: `${DEBUG_QUERY_TIMEOUT}ms`,
+        detailedTiming: DEBUG_DETAILED_TIMING
+      }
+    });
     this.timer = setInterval(() => {
       void this.drain();
     }, settings.queueDrainIntervalMs);
     void this.drain();
+  }
+
+  // Method to get current debug status
+  getDebugStatus() {
+    return {
+      currentOperation: this.currentOperation,
+      operationStartTime: new Date(this.operationStartTime).toISOString(),
+      lastProgressTimestamp: new Date(this.lastProgressTimestamp).toISOString(),
+      timeSinceLastProgress: Date.now() - this.lastProgressTimestamp,
+      debugConfig: {
+        sqlQueries: DEBUG_SQL_QUERIES,
+        queryTimeout: DEBUG_QUERY_TIMEOUT,
+        detailedTiming: DEBUG_DETAILED_TIMING
+      }
+    };
   }
 
   stop(): void {
@@ -46,7 +149,11 @@ export class DbWriterWorker {
     this.draining = true;
 
     // keep-alive heartbeat even if queues are empty
-    heartbeatMonitor.beat(WORKERS.dbWriter, { state: "draining" });
+    heartbeatMonitor.beat(WORKERS.dbWriter, {
+      state: "draining",
+      currentOperation: this.currentOperation,
+      lastProgress: Date.now() - this.lastProgressTimestamp
+    });
 
     try {
       let totalProcessed = 0;
@@ -77,11 +184,19 @@ export class DbWriterWorker {
         logger.info(`db-writer starting pipeline stage: ${stage.kind}`, {
           stage: stage.kind,
           batchSize: stage.batchSize,
-          totalProcessedSoFar: totalProcessed
+          totalProcessedSoFar: totalProcessed,
+          lastProgressTime: new Date(this.lastProgressTimestamp).toISOString()
         });
 
         const stageStart = Date.now();
-        const stageProcessed = await this.processQueue(stage);
+
+        // Wrap the entire stage processing in timeout detection
+        const stageProcessed = await this.timedDbOperation(
+          `process-${stage.kind}-stage`,
+          () => this.processQueue(stage),
+          { stage: stage.kind, batchSize: stage.batchSize }
+        );
+
         const stageDuration = Date.now() - stageStart;
 
         totalProcessed += stageProcessed;
@@ -93,15 +208,31 @@ export class DbWriterWorker {
           totalProcessedSoFar: totalProcessed,
           avgPerJob: stageProcessed > 0 ? `${Math.round(stageDuration / stageProcessed)}ms/job` : 'N/A'
         });
+
+        // Update heartbeat after each stage
+        heartbeatMonitor.beat(WORKERS.dbWriter, {
+          kind: stage.kind,
+          processed: totalProcessed,
+          currentOperation: this.currentOperation
+        });
       }
 
       if (totalProcessed === 0) {
         // beat + mark idle so heartbeat monitor never thinks we're dead
-        heartbeatMonitor.beat(WORKERS.dbWriter, { state: "idle" });
+        heartbeatMonitor.beat(WORKERS.dbWriter, {
+          state: "idle",
+          currentOperation: this.currentOperation
+        });
         heartbeatMonitor.markIdle(WORKERS.dbWriter);
       }
     } catch (error) {
-      logger.error("db-writer failed to drain queues", { error: formatError(error) });
+      logger.error("db-writer failed to drain queues", {
+        error: formatError(error),
+        currentOperation: this.currentOperation,
+        operationDuration: Date.now() - this.operationStartTime,
+        lastProgressTime: new Date(this.lastProgressTimestamp).toISOString()
+      });
+      throw error;
     } finally {
       this.draining = false;
     }
@@ -155,7 +286,8 @@ export class DbWriterWorker {
           processed += handled;
           heartbeatMonitor.beat(WORKERS.dbWriter, {
             kind: stage.kind,
-            processed
+            processed,
+            debugInfo: this.getDebugStatus()
           });
         }
       } catch (error) {
@@ -196,17 +328,30 @@ export class DbWriterWorker {
   private async processEventJobs(jobs: UpdateJob<NormalizedEvent>[]): Promise<number> {
     if (jobs.length === 0) return 0;
 
+    const polymarketIds = jobs.map(j => j.payload.polymarket_id);
     logger.debug('db-writer starting event job processing', {
       jobCount: jobs.length,
       jobIds: jobs.map(j => j.queuedAt),
-      polymarketIds: jobs.map(j => j.payload.polymarket_id)
+      polymarketIds,
+      timestamp: new Date().toISOString()
     });
 
     try {
-      await this.upsertEvents(jobs.map((job) => job.payload));
+      await this.timedDbOperation(
+        'upsert-events-batch',
+        () => this.upsertEvents(jobs.map((job) => job.payload)),
+        {
+          jobCount: jobs.length,
+          polymarketIds,
+          firstJobId: jobs[0]?.queuedAt,
+          lastJobId: jobs[jobs.length - 1]?.queuedAt
+        }
+      );
+
       logger.debug('db-writer completed event job processing', {
         jobCount: jobs.length,
-        processedIds: jobs.map(j => j.payload.polymarket_id)
+        processedIds: polymarketIds,
+        timestamp: new Date().toISOString()
       });
       return jobs.length;
     } catch (error) {
@@ -214,7 +359,10 @@ export class DbWriterWorker {
         jobCount: jobs.length,
         error: formatError(error),
         jobIds: jobs.map(j => j.queuedAt),
-        polymarketIds: jobs.map(j => j.payload.polymarket_id)
+        polymarketIds,
+        currentOperation: this.currentOperation,
+        operationDuration: Date.now() - this.operationStartTime,
+        timestamp: new Date().toISOString()
       });
       throw error;
     }
@@ -226,12 +374,14 @@ export class DbWriterWorker {
     const uniqueBatch = this.dedupeBatch(batch, (event) => event.polymarket_id, 'events');
 
     logger.debug('db-writer starting event batch upsert', {
-      batchSize: uniqueBatch.length,
-      polymarketIds: uniqueBatch.map(e => e.polymarket_id)
+      originalBatchSize: batch.length,
+      uniqueBatchSize: uniqueBatch.length,
+      polymarketIds: uniqueBatch.map(e => e.polymarket_id),
+      timestamp: new Date().toISOString()
     });
 
     const now = new Date();
-    const values = uniqueBatch.map((event) => ({
+    const values = uniqueBatch.map((event, index) => ({
       polymarketId: event.polymarket_id,
       title: event.title,
       slug: event.slug,
@@ -252,59 +402,96 @@ export class DbWriterWorker {
 
     logger.debug('db-writer executing events database upsert', {
       recordCount: values.length,
-      targetConflictColumn: 'polymarketId'
+      targetConflictColumn: 'polymarketId',
+      samplePolymarketIds: values.slice(0, 3).map(v => v.polymarketId),
+      sqlOperation: 'INSERT ... ON CONFLICT DO UPDATE'
     });
 
-    const startTime = Date.now();
+    if (DEBUG_SQL_QUERIES) {
+      logger.info('db-writer SQL DEBUG - Events upsert query', {
+        table: 'events',
+        operation: 'INSERT ON CONFLICT DO UPDATE',
+        conflictTarget: 'polymarket_id',
+        recordCount: values.length,
+        sampleData: values.slice(0, 2).map(v => ({
+          polymarketId: v.polymarketId,
+          title: v.title?.substring(0, 50) + '...',
+          active: v.active
+        }))
+      });
+    }
 
     try {
-      await db
-        .insert(events)
-        .values(values)
-        .onConflictDoUpdate({
-          target: events.polymarketId,
-          set: {
-            title: sql`excluded.title`,
-            slug: sql`excluded.slug`,
-            description: sql`excluded.description`,
-            category: sql`excluded.category`,
-            liquidity: sql`excluded.liquidity`,
-            volume24h: sql`excluded.volume_24h`,
-            volumeTotal: sql`excluded.volume_total`,
-            active: sql`excluded.active`,
-            closed: sql`excluded.closed`,
-            archived: sql`excluded.archived`,
-            restricted: sql`excluded.restricted`,
-            startDate: sql`excluded.start_date`,
-            endDate: sql`excluded.end_date`,
-            lastIngestedAt: sql`excluded.last_ingested_at`,
-            updatedAt: sql`excluded.updated_at`
-          }
-        });
+      const result = await this.timedDbOperation(
+        'events-bulk-upsert',
+        async () => {
+          const queryResult = await db
+            .insert(events)
+            .values(values)
+            .onConflictDoUpdate({
+              target: events.polymarketId,
+              set: {
+                title: sql`excluded.title`,
+                slug: sql`excluded.slug`,
+                description: sql`excluded.description`,
+                category: sql`excluded.category`,
+                liquidity: sql`excluded.liquidity`,
+                volume24h: sql`excluded.volume_24h`,
+                volumeTotal: sql`excluded.volume_total`,
+                active: sql`excluded.active`,
+                closed: sql`excluded.closed`,
+                archived: sql`excluded.archived`,
+                restricted: sql`excluded.restricted`,
+                startDate: sql`excluded.start_date`,
+                endDate: sql`excluded.end_date`,
+                lastIngestedAt: sql`excluded.last_ingested_at`,
+                updatedAt: sql`excluded.updated_at`
+              }
+            });
 
-      const duration = Date.now() - startTime;
+          if (DEBUG_SQL_QUERIES) {
+            logger.info('db-writer SQL DEBUG - Events upsert completed', {
+              result: 'success',
+              recordCount: values.length
+            });
+          }
+
+          return queryResult;
+        },
+        {
+          recordCount: values.length,
+          operation: 'INSERT ON CONFLICT DO UPDATE',
+          table: 'events',
+          conflictTarget: 'polymarketId'
+        }
+      );
+
       logger.debug('db-writer completed events database upsert', {
         recordCount: values.length,
-        duration: `${duration}ms`,
-        avgTimePerRecord: `${Math.round(duration / Math.max(values.length, 1))}ms`
-      });
-
-    } catch (error) {
-      const duration = Date.now() - startTime;
-      logger.error('db-writer events database upsert failed', {
-        recordCount: values.length,
-        duration: `${duration}ms`,
-        error: formatError(error),
         polymarketIds: values.map(v => v.polymarketId)
       });
 
-      // Check if this is a constraint violation
+    } catch (error) {
+      logger.error('db-writer events database upsert failed', {
+        recordCount: values.length,
+        error: formatError(error),
+        errorType: error?.constructor?.name,
+        errorCode: (error as any)?.code,
+        errorMessage: (error as Error)?.message,
+        polymarketIds: values.map(v => v.polymarketId),
+        sqlOperation: 'INSERT ON CONFLICT DO UPDATE',
+        timestamp: new Date().toISOString()
+      });
+
+      // Enhanced constraint violation detection
       if (this.isConstraintViolationError(error)) {
         logger.warn('db-writer detected constraint violation in events batch', {
           recordCount: values.length,
           error: (error as Error).message,
+          errorCode: (error as any)?.code,
           polymarketIds: values.map(v => v.polymarketId),
-          action: 'processing individually'
+          action: 'processing individually',
+          timestamp: new Date().toISOString()
         });
 
         // Fallback: process events individually to handle duplicates
@@ -795,27 +982,173 @@ export class DbWriterWorker {
 
   private async upsertEventsIndividually(events: NormalizedEvent[]): Promise<void> {
     logger.debug('db-writer processing events individually due to constraint violation', {
-      eventCount: events.length
+      eventCount: events.length,
+      polymarketIds: events.map(e => e.polymarket_id),
+      timestamp: new Date().toISOString()
     });
 
-    for (const event of events) {
+    let processedCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i];
+
+      if (!event) {
+        logger.warn('db-writer encountered null event in individual processing', {
+          eventIndex: i + 1,
+          totalEvents: events.length
+        });
+        continue;
+      }
+
       try {
-        await this.upsertEvents([event]);
+        logger.debug('db-writer processing individual event', {
+          eventIndex: i + 1,
+          totalEvents: events.length,
+          polymarketId: event.polymarket_id,
+          title: event.title?.substring(0, 50) + '...'
+        });
+
+        // Process single event with timeout to prevent hanging
+        await this.timedDbOperation(
+          'upsert-single-event',
+          () => this.upsertSingleEvent(event),
+          {
+            polymarketId: event.polymarket_id,
+            eventIndex: i + 1,
+            totalEvents: events.length
+          }
+        );
+
+        processedCount++;
+        logger.debug('db-writer successfully processed individual event', {
+          polymarketId: event.polymarket_id,
+          processedCount,
+          totalEvents: events.length
+        });
+
       } catch (error) {
         if (this.isConstraintViolationError(error)) {
           logger.debug('db-writer skipping duplicate event', {
-            polymarketId: event.polymarket_id
+            polymarketId: event.polymarket_id,
+            eventIndex: i + 1,
+            errorCode: (error as any)?.code,
+            errorMessage: (error as Error)?.message
           });
+          skippedCount++;
           continue; // Skip duplicates
         }
+
+        errorCount++;
         logger.error('db-writer failed to process individual event', {
           polymarketId: event.polymarket_id,
-          error: formatError(error)
+          eventIndex: i + 1,
+          error: formatError(error),
+          errorType: error?.constructor?.name,
+          errorCode: (error as any)?.code,
+          errorMessage: (error as Error)?.message,
+          processedCount,
+          skippedCount,
+          errorCount,
+          totalEvents: events.length,
+          timestamp: new Date().toISOString()
         });
+
+        // Continue processing other events instead of failing the entire batch
+        continue;
       }
     }
 
-    logger.debug('db-writer completed individual event processing');
+    logger.info('db-writer completed individual event processing', {
+      totalEvents: events.length,
+      processedCount,
+      skippedCount,
+      errorCount,
+      timestamp: new Date().toISOString()
+    });
+
+    // If we have too many errors, log a warning
+    if (errorCount > 0 && errorCount > events.length * 0.5) {
+      logger.warn('db-writer high error rate in individual event processing', {
+        errorRate: `${Math.round((errorCount / events.length) * 100)}%`,
+        errorCount,
+        totalEvents: events.length
+      });
+    }
+  }
+
+  // New method to process a single event (used in individual processing)
+  private async upsertSingleEvent(event: NormalizedEvent): Promise<void> {
+    const now = new Date();
+    const values = [{
+      polymarketId: event.polymarket_id,
+      title: event.title,
+      slug: event.slug,
+      description: event.description,
+      category: event.category,
+      liquidity: this.decimal(event.liquidity) ?? "0",
+      volume24h: this.decimal(event.volume) ?? "0",
+      volumeTotal: this.decimal(event.volume) ?? "0",
+      active: event.is_active,
+      closed: event.closed,
+      archived: event.archived,
+      restricted: event.restricted,
+      startDate: this.toDate(event.start_date),
+      endDate: this.toDate(event.end_date),
+      lastIngestedAt: this.toDate(event.last_ingested_at) ?? now,
+      updatedAt: now
+    }];
+
+    if (DEBUG_SQL_QUERIES) {
+      logger.info('db-writer SQL DEBUG - Single event upsert', {
+        polymarketId: event.polymarket_id,
+        title: event.title?.substring(0, 50) + '...',
+        operation: 'INSERT ON CONFLICT DO UPDATE (single record)'
+      });
+    }
+
+    try {
+      await db
+        .insert(events)
+        .values(values)
+        .onConflictDoUpdate({
+          target: events.polymarketId,
+          set: {
+            title: sql`excluded.title`,
+            slug: sql`excluded.slug`,
+            description: sql`excluded.description`,
+            category: sql`excluded.category`,
+            liquidity: sql`excluded.liquidity`,
+            volume24h: sql`excluded.volume_24h`,
+            volumeTotal: sql`excluded.volume_total`,
+            active: sql`excluded.active`,
+            closed: sql`excluded.closed`,
+            archived: sql`excluded.archived`,
+            restricted: sql`excluded.restricted`,
+            startDate: sql`excluded.start_date`,
+            endDate: sql`excluded.end_date`,
+            lastIngestedAt: sql`excluded.last_ingested_at`,
+            updatedAt: sql`excluded.updated_at`
+          }
+        });
+
+      if (DEBUG_SQL_QUERIES) {
+        logger.info('db-writer SQL DEBUG - Single event upsert completed', {
+          polymarketId: event.polymarket_id,
+          result: 'success'
+        });
+      }
+    } catch (error) {
+      if (DEBUG_SQL_QUERIES) {
+        logger.error('db-writer SQL DEBUG - Single event upsert failed', {
+          polymarketId: event.polymarket_id,
+          error: formatError(error),
+          errorCode: (error as any)?.code
+        });
+      }
+      throw error;
+    }
   }
 }
 
